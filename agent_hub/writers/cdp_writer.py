@@ -156,6 +156,7 @@ class CdpWriter:
         new_chat_shortcut: dict[str, Any] | None = None,
         switch_verify_timeout_s: float = 2.5,
         switch_poll_interval_s: float = 0.15,
+        create_url_poll_timeout_s: float = 3.0,
     ) -> None:
         self.app_name = app_name
         self.env_port_var = env_port_var
@@ -169,6 +170,7 @@ class CdpWriter:
         self.new_chat_shortcut = dict(new_chat_shortcut or {"key": "n", "code": "KeyN", "modifiers": 4})
         self.switch_verify_timeout_s = max(0.05, float(switch_verify_timeout_s))
         self.switch_poll_interval_s = max(0.01, float(switch_poll_interval_s))
+        self.create_url_poll_timeout_s = max(0.05, float(create_url_poll_timeout_s))
         self._lock = threading.Lock()
         self._msg_id = 0
 
@@ -198,16 +200,27 @@ class CdpWriter:
             return None
         return None
 
+    @staticmethod
+    def _is_usable_page(target: dict[str, Any]) -> bool:
+        if target.get("type") != "page" or not target.get("webSocketDebuggerUrl"):
+            return False
+        url = str(target.get("url") or "").strip().lower()
+        if url in ("", "about:blank") or url.startswith("data:") or "overlay" in url:
+            return False
+        title_low = str(target.get("title") or "").strip().lower()
+        if title_low.startswith("data:"):
+            return False
+        return True
+
     def _discover_endpoint(self) -> tuple[int | None, list[dict[str, Any]]]:
         for port in self._candidate_ports():
             targets = self._fetch_targets(port)
             if targets is None:
                 continue
-            pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+            pages = [t for t in targets if self._is_usable_page(t)]
             if pages:
                 pages.sort(
                     key=lambda t: (
-                        1 if t.get("url", "").startswith("data:") or "overlay" in t.get("url", "").lower() else 0,
                         0 if t.get("title") in ("Antigravity", "ChatGPT") or "chatgpt.com" in t.get("url", "") else 1,
                     )
                 )
@@ -225,6 +238,9 @@ class CdpWriter:
             return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
           };
           const selectors = [
+            '[aria-label="Message input"]',
+            'div.ProseMirror[aria-label*="询问"]',
+            'div.ProseMirror[aria-label*="Ask" i]',
             'textarea[placeholder*="Ask"]',
             'textarea[placeholder*="Message"]',
             'textarea[placeholder*="message"]',
@@ -592,6 +608,26 @@ class CdpWriter:
         res = self._cdp_eval(ws, click_script, await_promise=True)
         if not isinstance(res, dict) or not res.get("ok"):
             raise RuntimeError(f"{self.app_name} CDP send failed: {res}")
+
+        time.sleep(0.25)
+        verify_script = f"""
+        (() => {{
+          // __agentHubVerifyPostSend
+          {_JS_DOM_PRELUDE}
+          const comp = findComposer();
+          const draft = comp ? readDraft(comp).trim() : '';
+          const stopBtn = [...document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[data-testid*="stop" i]')]
+            .filter(visible)[0];
+          return {{ composer_cleared: draft.length === 0, is_generating: Boolean(stopBtn) }};
+        }})()
+        """
+        try:
+            verify = self._cdp_eval(ws, verify_script, await_promise=False)
+            if isinstance(verify, dict) and "composer_cleared" in verify:
+                res["composer_cleared"] = bool(verify.get("composer_cleared"))
+                res["is_generating"] = bool(verify.get("is_generating"))
+        except Exception:  # noqa: BLE001
+            pass
         return res
 
     def create_session(
@@ -709,14 +745,26 @@ class CdpWriter:
                     reasoning_effort=reasoning_effort,
                 )
 
+                session_id = ""
                 if initial_message.strip():
                     send_res = self._cdp_inject_and_send(ws, initial_message)
-                    time.sleep(0.4)
+                    deadline = time.monotonic() + self.create_url_poll_timeout_s
+                    while True:
+                        href = self._cdp_eval(ws, "window.location.href", await_promise=False)
+                        m = _SESSION_URL_RE.search(str(href or ""))
+                        if m:
+                            session_id = m.group(1)
+                            break
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(self.switch_poll_interval_s)
+                else:
+                    href = self._cdp_eval(ws, "window.location.href", await_promise=False)
+                    m = _SESSION_URL_RE.search(str(href or ""))
+                    session_id = m.group(1) if m else ""
 
-                href = self._cdp_eval(ws, "window.location.href", await_promise=False)
-                href_str = str(href or "")
-                m = _SESSION_URL_RE.search(href_str)
-                session_id = m.group(1) if m else f"{self.app_name}-cdp-{int(time.time() * 1000)}"
+                if not session_id:
+                    session_id = f"{self.app_name}-cdp-{int(time.time() * 1000)}"
 
             out: dict[str, Any] = {
                 "ok": True,
@@ -903,6 +951,148 @@ class CdpWriter:
             return pathname == f"/c/{expected}" and actual_sid == expected
         return actual_sid == expected
 
+    def _select_page(self, pages: list[dict[str, Any]], expected_sid: str, target_title: str) -> dict[str, Any]:
+        target = pages[0]
+        matched_page = False
+        for p in pages:
+            pu = str(p.get("url") or "")
+            if f"/c/{expected_sid}" in pu or f"/t/{expected_sid}" in pu:
+                target = p
+                matched_page = True
+                break
+        if not matched_page and target_title:
+            tl = target_title.lower()
+            for p in pages:
+                pt = str(p.get("title", "")).strip().lower()
+                if pt and (tl in pt or pt in tl):
+                    target = p
+                    break
+        return target
+
+    def _ensure_target_session(
+        self,
+        ws: SimpleWebSocket,
+        expected_sid: str,
+        target_title: str = "",
+    ) -> tuple[dict[str, Any], bool, str]:
+        """Verify active UI session matches expected_sid or switch via sidebar, failing closed."""
+        js_payload = json.dumps({"targetTitle": target_title, "sessionId": expected_sid})
+        switch_script = f"""
+        (async () => {{
+          const cfg = {js_payload};
+          {_JS_DOM_PRELUDE}
+          const norm = (v) => String(v || '').trim()
+            .replace(/^chatgpt:conversation:/, '')
+            .replace(/^chatgpt:/, '')
+            .replace(/^local:/, '')
+            .trim();
+          const isNewChatButton = (el) => {{
+            const hay = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
+            return /(?:^|\\b)(?:new chat|new thread|new conversation)(?:$|\\b)|新聊天|新线程|新对话|新建对话|新建聊天/.test(hay);
+          }};
+          const findBySessionId = (sid) => {{
+            if (!sid) return null;
+            for (const a of document.querySelectorAll('a[href]')) {{
+              if (!visible(a) || isNewChatButton(a)) continue;
+              const href = String(a.getAttribute('href') || '');
+              if (href === '/c/' + sid || href.startsWith('/c/' + sid + '?') || href.endsWith('/c/' + sid) || href.includes('/' + sid)) {{
+                return {{ el: a, method: 'id-href' }};
+              }}
+            }}
+            const idAttrs = [
+              'data-cascade-id',
+              'data-app-action-sidebar-thread-id',
+              'data-sidebar-archive-chatgpt-id',
+              'data-sidebar-chatgpt-conversation-key',
+              'data-thread-id',
+              'data-conversation-id',
+            ];
+            for (const attr of idAttrs) {{
+              for (const el of document.querySelectorAll('[' + attr + ']')) {{
+                if (!visible(el) || isNewChatButton(el)) continue;
+                if (norm(el.getAttribute(attr)) === sid) {{
+                  return {{ el, method: 'id-' + attr }};
+                }}
+              }}
+            }}
+            return null;
+          }};
+
+          let hit = findBySessionId(cfg.sessionId);
+          if (!hit) {{
+            const sidebarToggle = [...document.querySelectorAll('[data-testid="sidebar-toggle"], button[aria-label*="Sidebar" i], button[aria-label*="侧边栏"]')]
+              .filter(visible)[0];
+            if (sidebarToggle) {{
+              sidebarToggle.click();
+              await sleep(250);
+              hit = findBySessionId(cfg.sessionId);
+            }}
+          }}
+
+          if (!hit && cfg.targetTitle) {{
+            const needle = cfg.targetTitle.trim().toLowerCase();
+            if (needle) {{
+              const scoped = [...document.querySelectorAll(
+                '[data-testid="conversation-row-sidebar"], a[href^="/c/"], [data-sidebar-cycle-item], [data-app-action-sidebar-thread-row], aside a, aside button, nav a, nav button'
+              )].filter((el) => {{
+                if (!visible(el) || isNewChatButton(el)) return false;
+                const txt = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                return txt && txt.length < 180 && (txt === needle || txt.includes(needle) || (txt.length >= 4 && needle.includes(txt)));
+              }});
+              if (scoped.length > 0) {{
+                hit = {{ el: scoped[0], method: 'sidebar-title' }};
+              }}
+            }}
+          }}
+
+          if (hit && hit.el) {{
+            hit.el.click();
+            await sleep(250);
+            return {{ ok: true, switched: true, switchMethod: hit.method }};
+          }}
+          return {{ ok: true, switched: false, switchMethod: 'not-found' }};
+        }})()
+        """
+
+        identity = self._read_active_session_identity(ws)
+        switched = False
+        switch_method = "already-active"
+
+        if not self._matches_target_session(identity, expected_sid):
+            sw_res = self._cdp_eval(ws, switch_script, await_promise=True)
+            if not isinstance(sw_res, dict) or not sw_res.get("ok"):
+                raise RuntimeError(f"{self.app_name} CDP switch failed: {sw_res}")
+            switched = bool(sw_res.get("switched"))
+            switch_method = str(sw_res.get("switchMethod") or ("clicked" if switched else "not-found"))
+
+            if switched:
+                deadline = time.monotonic() + self.switch_verify_timeout_s
+                while True:
+                    identity = self._read_active_session_identity(ws)
+                    if self._matches_target_session(identity, expected_sid):
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(self.switch_poll_interval_s)
+            else:
+                identity = self._read_active_session_identity(ws)
+
+            if not self._matches_target_session(identity, expected_sid):
+                raise SessionMismatchError(
+                    app_name=self.app_name,
+                    expected_session_id=expected_sid,
+                    actual_session_id=str(identity.get("session_id") or ""),
+                    actual_url=str(identity.get("url") or ""),
+                    actual_title=str(identity.get("title") or ""),
+                    reason=(
+                        f"session switch did not land on target within {self.switch_verify_timeout_s:.1f}s "
+                        f"(switch_method={switch_method})"
+                        if switched
+                        else "could not locate target session in sidebar to switch"
+                    ),
+                )
+        return identity, switched, switch_method
+
     def send_message(
         self,
         session_id: str,
@@ -926,24 +1116,8 @@ class CdpWriter:
                     f"{self.app_name} CDP is not active. Relaunch with {self.launcher_hint} to enable GUI sends."
                 )
 
-            target = pages[0]
-            matched_page = False
-            for p in pages:
-                pu = str(p.get("url") or "")
-                if f"/c/{expected_sid}" in pu or f"/t/{expected_sid}" in pu:
-                    target = p
-                    matched_page = True
-                    break
-            if not matched_page and target_title:
-                tl = target_title.lower()
-                for p in pages:
-                    pt = str(p.get("title", "")).strip().lower()
-                    if pt and (tl in pt or pt in tl):
-                        target = p
-                        break
-
+            target = self._select_page(pages, expected_sid, target_title)
             ws_url = str(target["webSocketDebuggerUrl"])
-            js_payload = json.dumps({"targetTitle": target_title, "sessionId": expected_sid})
 
             pre_draft_script = f"""
             (() => {{
@@ -953,83 +1127,6 @@ class CdpWriter:
                 return {{ ok: false, error: 'draft-present', message: 'Composer has unsaved user draft; aborted to avoid overwriting.' }};
               }}
               return {{ ok: true }};
-            }})()
-            """
-
-            switch_script = f"""
-            (async () => {{
-              const cfg = {js_payload};
-              {_JS_DOM_PRELUDE}
-              const norm = (v) => String(v || '').trim()
-                .replace(/^chatgpt:conversation:/, '')
-                .replace(/^chatgpt:/, '')
-                .replace(/^local:/, '')
-                .trim();
-              const isNewChatButton = (el) => {{
-                const hay = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).toLowerCase();
-                return /(?:^|\\b)(?:new chat|new thread|new conversation)(?:$|\\b)|新聊天|新线程|新对话|新建对话|新建聊天/.test(hay);
-              }};
-              const findBySessionId = (sid) => {{
-                if (!sid) return null;
-                for (const a of document.querySelectorAll('a[href]')) {{
-                  if (!visible(a) || isNewChatButton(a)) continue;
-                  const href = String(a.getAttribute('href') || '');
-                  if (href === '/c/' + sid || href.startsWith('/c/' + sid + '?') || href.endsWith('/c/' + sid) || href.includes('/' + sid)) {{
-                    return {{ el: a, method: 'id-href' }};
-                  }}
-                }}
-                const idAttrs = [
-                  'data-cascade-id',
-                  'data-app-action-sidebar-thread-id',
-                  'data-sidebar-archive-chatgpt-id',
-                  'data-sidebar-chatgpt-conversation-key',
-                  'data-thread-id',
-                  'data-conversation-id',
-                ];
-                for (const attr of idAttrs) {{
-                  for (const el of document.querySelectorAll('[' + attr + ']')) {{
-                    if (!visible(el) || isNewChatButton(el)) continue;
-                    if (norm(el.getAttribute(attr)) === sid) {{
-                      return {{ el, method: 'id-' + attr }};
-                    }}
-                  }}
-                }}
-                return null;
-              }};
-
-              let hit = findBySessionId(cfg.sessionId);
-              if (!hit) {{
-                const sidebarToggle = [...document.querySelectorAll('[data-testid="sidebar-toggle"], button[aria-label*="Sidebar" i], button[aria-label*="侧边栏"]')]
-                  .filter(visible)[0];
-                if (sidebarToggle) {{
-                  sidebarToggle.click();
-                  await sleep(250);
-                  hit = findBySessionId(cfg.sessionId);
-                }}
-              }}
-
-              if (!hit && cfg.targetTitle) {{
-                const needle = cfg.targetTitle.trim().toLowerCase();
-                if (needle) {{
-                  const scoped = [...document.querySelectorAll(
-                    '[data-testid="conversation-row-sidebar"], a[href^="/c/"], [data-sidebar-cycle-item], [data-app-action-sidebar-thread-row], aside a, aside button, nav a, nav button'
-                  )].filter((el) => {{
-                    if (!visible(el) || isNewChatButton(el)) return false;
-                    const txt = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
-                    return txt && txt.length < 180 && (txt === needle || txt.includes(needle) || (txt.length >= 4 && needle.includes(txt)));
-                  }});
-                  if (scoped.length > 0) {{
-                    hit = {{ el: scoped[0], method: 'sidebar-title' }};
-                  }}
-                }}
-              }}
-
-              if (hit && hit.el) {{
-                hit.el.click();
-                await sleep(250);
-                return {{ ok: true, switched: true, switchMethod: hit.method }};
-              }}
-              return {{ ok: true, switched: false, switchMethod: 'not-found' }};
             }})()
             """
 
@@ -1052,43 +1149,7 @@ class CdpWriter:
                 if not isinstance(pre_draft, dict) or not pre_draft.get("ok"):
                     raise RuntimeError(f"{self.app_name} CDP send prep failed: {pre_draft}")
 
-                identity = self._read_active_session_identity(ws)
-                switched = False
-                switch_method = "already-active"
-
-                if not self._matches_target_session(identity, expected_sid):
-                    sw_res = self._cdp_eval(ws, switch_script, await_promise=True)
-                    if not isinstance(sw_res, dict) or not sw_res.get("ok"):
-                        raise RuntimeError(f"{self.app_name} CDP switch failed: {sw_res}")
-                    switched = bool(sw_res.get("switched"))
-                    switch_method = str(sw_res.get("switchMethod") or ("clicked" if switched else "not-found"))
-
-                    if switched:
-                        deadline = time.monotonic() + self.switch_verify_timeout_s
-                        while True:
-                            identity = self._read_active_session_identity(ws)
-                            if self._matches_target_session(identity, expected_sid):
-                                break
-                            if time.monotonic() >= deadline:
-                                break
-                            time.sleep(self.switch_poll_interval_s)
-                    else:
-                        identity = self._read_active_session_identity(ws)
-
-                    if not self._matches_target_session(identity, expected_sid):
-                        raise SessionMismatchError(
-                            app_name=self.app_name,
-                            expected_session_id=expected_sid,
-                            actual_session_id=str(identity.get("session_id") or ""),
-                            actual_url=str(identity.get("url") or ""),
-                            actual_title=str(identity.get("title") or ""),
-                            reason=(
-                                f"session switch did not land on target within {self.switch_verify_timeout_s:.1f}s "
-                                f"(switch_method={switch_method})"
-                                if switched
-                                else "could not locate target session in sidebar to switch"
-                            ),
-                        )
+                _, switched, switch_method = self._ensure_target_session(ws, expected_sid, target_title)
 
                 composer_check = self._cdp_eval(ws, post_switch_composer_script, await_promise=False)
                 if not isinstance(composer_check, dict) or not composer_check.get("ok"):
@@ -1133,6 +1194,187 @@ class CdpWriter:
             if model_selection is not None:
                 out["modelSelection"] = model_selection
             return out
+
+    @staticmethod
+    def _normalize_decision(decision: str) -> str:
+        raw = (decision or "").strip().lower()
+        if raw in ("yes", "y", "approve", "approved", "allow", "accept", "proceed", "confirm", "同意", "允许", "批准", "确认", "放行"):
+            return "yes"
+        if raw in ("no", "n", "reject", "rejected", "deny", "denied", "decline", "cancel", "拒绝", "不同意", "不允许", "驳回"):
+            return "no"
+        raise ValueError(f"Invalid approval decision '{decision}'; expected 'yes' or 'no'.")
+
+    def respond_approval(
+        self,
+        session_id: str,
+        decision: str = "yes",
+        *,
+        target_title: str = "",
+        feedback: str = "",
+    ) -> dict[str, Any]:
+        """Verify target Electron session and click the matching approval/deny button via CDP."""
+        expected_sid = self._normalize_session_id(session_id)
+        if not expected_sid:
+            raise ValueError(f"{self.app_name} respond_approval requires a non-empty session_id")
+        norm_decision = self._normalize_decision(decision)
+
+        with self._lock:
+            port, pages = self._discover_endpoint()
+            if port is None or not pages:
+                raise ConnectionError(
+                    f"{self.app_name} CDP is not active. Relaunch with {self.launcher_hint} to enable GUI approval."
+                )
+
+            target = self._select_page(pages, expected_sid, target_title)
+            ws_url = str(target["webSocketDebuggerUrl"])
+            payload = json.dumps({"decision": norm_decision})
+            click_approval_script = f"""
+            (async () => {{
+              // __agentHubRespondApproval
+              const cfg = {payload};
+              {_JS_DOM_PRELUDE}
+              const inSidebarOrNav = (el) => Boolean(
+                el.closest('aside, nav, [data-testid="conversation-row-sidebar"], [data-sidebar-cycle-item]')
+              );
+              const labelOf = (el) => (
+                ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.getAttribute('data-testid') || ''))
+                .replace(/\\s+/g, ' ')
+                .trim()
+              );
+              const yesTestIds = ['approve', 'allow', 'accept', 'proceed', 'confirm'];
+              const noTestIds = ['deny', 'reject', 'decline'];
+              const yesTextRe = /\\b(approve|allow(?: once| always)?|accept|proceed|confirm|run command|continue|yes)\\b|批准|允许|同意|确认|放行|继续执行/i;
+              const noTextRe = /\\b(deny|reject|decline|don't allow|do not allow|cancel|no)\\b|拒绝|不允许|驳回|取消/i;
+
+              const btns = [...document.querySelectorAll('button, [role="button"]')].filter((el) => (
+                visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !inSidebarOrNav(el)
+              ));
+              let best = null;
+              let bestScore = 0;
+              for (const el of btns) {{
+                const full = labelOf(el);
+                if (!full || full.length > 140) continue;
+                const tid = String(el.getAttribute('data-testid') || '').toLowerCase();
+                const txt = String(el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                let score = 0;
+                if (cfg.decision === 'yes') {{
+                  if (yesTestIds.some((k) => tid.includes(k))) score += 25;
+                  if (yesTextRe.test(txt)) score += 15;
+                  if (/^(approve|allow|accept|proceed|confirm|yes|批准|允许|同意|确认|放行)$/i.test(txt)) score += 20;
+                  if (noTextRe.test(txt) && !yesTextRe.test(txt)) score = 0;
+                }} else {{
+                  if (noTestIds.some((k) => tid.includes(k))) score += 25;
+                  if (noTextRe.test(txt)) score += 15;
+                  if (/^(deny|reject|decline|no|拒绝|不允许|驳回)$/i.test(txt)) score += 20;
+                  if (yesTextRe.test(txt) && !noTextRe.test(txt)) score = 0;
+                }}
+                if (score > bestScore) {{
+                  bestScore = score;
+                  best = {{ el, label: txt || tid || 'button', score }};
+                }}
+              }}
+              if (!best) {{
+                return {{ ok: false, error: 'approval-button-not-found', candidate_count: btns.length }};
+              }}
+              best.el.click();
+              await sleep(200);
+              return {{ ok: true, clicked_label: best.label, score: best.score }};
+            }})()
+            """
+
+            with SimpleWebSocket(ws_url, timeout=15.0) as ws:
+                _, switched, switch_method = self._ensure_target_session(ws, expected_sid, target_title)
+                final_identity = self._read_active_session_identity(ws)
+                if not self._matches_target_session(final_identity, expected_sid):
+                    raise SessionMismatchError(
+                        app_name=self.app_name,
+                        expected_session_id=expected_sid,
+                        actual_session_id=str(final_identity.get("session_id") or ""),
+                        actual_url=str(final_identity.get("url") or ""),
+                        actual_title=str(final_identity.get("title") or ""),
+                        reason="active session drifted prior to approval click",
+                    )
+
+                click_res = self._cdp_eval(ws, click_approval_script, await_promise=True)
+                if not isinstance(click_res, dict) or not click_res.get("ok"):
+                    raise RuntimeError(
+                        f"{self.app_name} no visible '{norm_decision}' approval button found in verified session '{expected_sid}': {click_res}"
+                    )
+
+            verified_title = str(final_identity.get("title") or target_title or "").strip()
+            return {
+                "ok": True,
+                "action": "respondApproval",
+                "decision": norm_decision,
+                "transport": "electron-cdp",
+                "port": port,
+                "sessionId": expected_sid,
+                "verified_session_id": expected_sid,
+                "verified_title": verified_title,
+                "switched": switched,
+                "switch_method": switch_method,
+                "clicked_label": click_res.get("clicked_label", ""),
+                **({"feedback_note": "GUI button click only; feedback text was not injected"} if feedback.strip() else {}),
+            }
+
+    def cancel_session(self, session_id: str, *, target_title: str = "") -> dict[str, Any]:
+        """Verify target Electron session and click the active Stop/Cancel button via CDP."""
+        expected_sid = self._normalize_session_id(session_id)
+        if not expected_sid:
+            raise ValueError(f"{self.app_name} cancel_session requires a non-empty session_id")
+
+        with self._lock:
+            port, pages = self._discover_endpoint()
+            if port is None or not pages:
+                raise ConnectionError(
+                    f"{self.app_name} CDP is not active. Relaunch with {self.launcher_hint} to enable GUI cancel."
+                )
+
+            target = self._select_page(pages, expected_sid, target_title)
+            ws_url = str(target["webSocketDebuggerUrl"])
+            stop_script = f"""
+            (async () => {{
+              // __agentHubCancelSession
+              {_JS_DOM_PRELUDE}
+              const stopBtn = [...document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[data-testid*="stop" i]')]
+                .filter((b) => visible(b) && !b.disabled)[0];
+              if (!stopBtn) {{
+                return {{ ok: false, error: 'stop-button-not-found' }};
+              }}
+              const lbl = (stopBtn.getAttribute('aria-label') || stopBtn.innerText || 'stop').trim();
+              stopBtn.click();
+              await sleep(200);
+              return {{ ok: true, clicked_label: lbl }};
+            }})()
+            """
+            with SimpleWebSocket(ws_url, timeout=15.0) as ws:
+                _, switched, switch_method = self._ensure_target_session(ws, expected_sid, target_title)
+                final_identity = self._read_active_session_identity(ws)
+                if not self._matches_target_session(final_identity, expected_sid):
+                    raise SessionMismatchError(
+                        app_name=self.app_name,
+                        expected_session_id=expected_sid,
+                        actual_session_id=str(final_identity.get("session_id") or ""),
+                        actual_url=str(final_identity.get("url") or ""),
+                        actual_title=str(final_identity.get("title") or ""),
+                        reason="active session drifted prior to cancel click",
+                    )
+                stop_res = self._cdp_eval(ws, stop_script, await_promise=True)
+                if not isinstance(stop_res, dict) or not stop_res.get("ok"):
+                    raise RuntimeError(f"{self.app_name} active Stop button not found for session '{expected_sid}': {stop_res}")
+
+            return {
+                "ok": True,
+                "action": "cancelSession",
+                "transport": "electron-cdp",
+                "port": port,
+                "sessionId": expected_sid,
+                "verified_session_id": expected_sid,
+                "verified_title": str(final_identity.get("title") or target_title or "").strip(),
+                "switched": switched,
+                "switch_method": switch_method,
+                "clicked_label": stop_res.get("clicked_label", ""),
+            }
 
 
 class AntigravityWriter(CdpWriter):

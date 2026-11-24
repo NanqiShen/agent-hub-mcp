@@ -429,6 +429,86 @@ class DshAdapter:
                 parts.append(f"[tool-call: {name} args={args}]")
         return "\n".join(parts)
 
+    @classmethod
+    def _parse_jsonl_messages(cls, raw: str, *, include_tools: bool) -> list[SessionMessage]:
+        messages: list[SessionMessage] = []
+        for idx, line in enumerate(raw.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            etype = obj.get("type", "")
+            data = obj.get("data") or {}
+            seq = int(obj.get("seq") or idx)
+            ts = format_local_iso(parse_iso_or_epoch_ms(obj.get("time")))
+
+            if etype == "user/message":
+                src = data.get("source")
+                src_kind = src.get("kind", "") if isinstance(src, dict) else ""
+                if src_kind in _SYNTHETIC_USER_KINDS:
+                    continue
+                text = extract_text_blocks(data.get("content"))
+                if text.strip():
+                    messages.append(SessionMessage(index=seq, role="user", content=text, timestamp=ts))
+            elif etype == "assistant/message":
+                msg_obj = data.get("message") or {}
+                text = cls._extract_assistant_blocks(msg_obj.get("content"), include_tools=include_tools)
+                if text.strip():
+                    messages.append(SessionMessage(index=seq, role="assistant", content=text, timestamp=ts))
+            elif include_tools and etype == "tool/result":
+                tool_name = data.get("name") or data.get("toolName") or "tool"
+                out = clean_single_line(json.dumps(data.get("result", data), ensure_ascii=False), 320)
+                messages.append(
+                    SessionMessage(index=seq, role="tool", content=f"[tool/result: {tool_name}] {out}", timestamp=ts)
+                )
+        return messages
+
+    def _read_messages_from_zstd(
+        self,
+        zpath: Path,
+        *,
+        tail_messages: int,
+        include_tools: bool,
+        tail_budget_bytes: int = 2_000_000,
+    ) -> list[SessionMessage]:
+        need = max(1, int(tail_messages))
+        try:
+            file_size = zpath.stat().st_size
+        except OSError:
+            return []
+
+        if file_size <= tail_budget_bytes:
+            try:
+                raw = zstd.decompress(zpath.read_bytes()).decode("utf-8", errors="replace")
+            except (OSError, zstd.ZstdError):
+                return []
+            return self._parse_jsonl_messages(raw, include_tools=include_tools)
+
+        # Fast path: decompress tail frames first without unpacking huge multi-MB logs.
+        tail_raw = self._decompress_zstd_tail(zpath, max_comp_bytes=tail_budget_bytes)
+        messages = self._parse_jsonl_messages(tail_raw, include_tools=include_tools) if tail_raw else []
+        if len(messages) >= need:
+            return messages
+
+        larger_budget = tail_budget_bytes * 3
+        if larger_budget < file_size:
+            wider_raw = self._decompress_zstd_tail(zpath, max_comp_bytes=larger_budget)
+            wider_msgs = self._parse_jsonl_messages(wider_raw, include_tools=include_tools) if wider_raw else []
+            if len(wider_msgs) >= need:
+                return wider_msgs
+            if len(wider_msgs) > len(messages):
+                messages = wider_msgs
+
+        try:
+            full_raw = zstd.decompress(zpath.read_bytes()).decode("utf-8", errors="replace")
+            return self._parse_jsonl_messages(full_raw, include_tools=include_tools)
+        except (OSError, zstd.ZstdError):
+            return messages
+
     def read_session(
         self,
         session_id: str,
@@ -436,6 +516,7 @@ class DshAdapter:
         tail_messages: int = 10,
         max_chars_per_message: int = 6000,
         include_tools: bool = False,
+        tail_budget_bytes: int = 2_000_000,
     ) -> dict[str, Any]:
         meta = self.get_session_meta(session_id)
         if meta is None:
@@ -444,38 +525,12 @@ class DshAdapter:
         messages: list[SessionMessage] = []
         zpath = self._find_zstd_log(meta.session_id) or self._find_zstd_log(session_id)
         if zpath is not None:
-            raw = zstd.decompress(zpath.read_bytes()).decode("utf-8", errors="replace")
-            for idx, line in enumerate(raw.splitlines()):
-                if not line.strip():
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                etype = obj.get("type", "")
-                data = obj.get("data") or {}
-                seq = int(obj.get("seq") or idx)
-                ts = format_local_iso(parse_iso_or_epoch_ms(obj.get("time")))
-
-                if etype == "user/message":
-                    src = data.get("source")
-                    src_kind = src.get("kind", "") if isinstance(src, dict) else ""
-                    if src_kind in _SYNTHETIC_USER_KINDS:
-                        continue
-                    text = extract_text_blocks(data.get("content"))
-                    if text.strip():
-                        messages.append(SessionMessage(index=seq, role="user", content=text, timestamp=ts))
-                elif etype == "assistant/message":
-                    msg_obj = data.get("message") or {}
-                    text = self._extract_assistant_blocks(msg_obj.get("content"), include_tools=include_tools)
-                    if text.strip():
-                        messages.append(SessionMessage(index=seq, role="assistant", content=text, timestamp=ts))
-                elif include_tools and etype == "tool/result":
-                    tool_name = data.get("name") or data.get("toolName") or "tool"
-                    out = clean_single_line(json.dumps(data.get("result", data), ensure_ascii=False), 320)
-                    messages.append(
-                        SessionMessage(index=seq, role="tool", content=f"[tool/result: {tool_name}] {out}", timestamp=ts)
-                    )
+            messages = self._read_messages_from_zstd(
+                zpath,
+                tail_messages=tail_messages,
+                include_tools=include_tools,
+                tail_budget_bytes=tail_budget_bytes,
+            )
         else:
             # Fallback to turnOutline inside projcache if zstd file is absent
             pc = self._find_projcache(session_id)

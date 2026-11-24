@@ -834,27 +834,38 @@ class TestWatchdog(unittest.TestCase):
             meta.status_detail = ""
             runner.poll_once(now_ts=t0 + 60)
 
-            # 2. Same-event repeat (running -> error) at t0 + 2m blocked by cooldown
+            # 2. Same-event repeat (running -> error) at t0 + 2m IS blocked by per-event cooldown
             meta.status = STATUS_ERROR
             r1 = runner.poll_once(now_ts=t0 + 120)
             self.assertEqual(r1["event_count"], 0)
             self.assertEqual(len(sent), 1)
 
-            # 3. Cross-event alternation (running -> idle completed) at t0 + 3m blocked by cooldown
+            # 3. Distinct event (completed) at t0 + 3m MUST NOT be masked by prior error cooldown
             meta.status = STATUS_RUNNING
             runner.poll_once(now_ts=t0 + 150)
             meta.status = STATUS_IDLE
             r2 = runner.poll_once(now_ts=t0 + 180)
-            self.assertEqual(r2["event_count"], 0)
-            self.assertEqual(len(sent), 1)
+            self.assertEqual(r2["event_count"], 1)
+            self.assertEqual(r2["events"][0]["event"], "completed")
+            self.assertEqual(len(sent), 2)
 
-            # 4. waiting_approval at t0 + 4m blocked by cooldown
+            # 4. High-priority waiting_approval at t0 + 4m MUST NOT be masked by completed cooldown
             meta.status = STATUS_WAITING_APPROVAL
+            meta.status_detail = "awaiting command confirm"
             r3 = runner.poll_once(now_ts=t0 + 240)
-            self.assertEqual(r3["event_count"], 0)
-            self.assertEqual(len(sent), 1)
+            self.assertEqual(r3["event_count"], 1)
+            self.assertEqual(r3["events"][0]["event"], "waiting_approval")
+            self.assertEqual(len(sent), 3)
 
-            # 5. After 16m (>15m cooldown), running -> error fires cleanly
+            # 5. Same-event repeat waiting_approval within cooldown IS suppressed
+            meta.status = STATUS_RUNNING
+            runner.poll_once(now_ts=t0 + 270)
+            meta.status = STATUS_WAITING_APPROVAL
+            r3b = runner.poll_once(now_ts=t0 + 300)
+            self.assertEqual(r3b["event_count"], 0)
+            self.assertEqual(len(sent), 3)
+
+            # 6. After 16m (>15m cooldown), running -> error fires cleanly again
             meta.status = STATUS_RUNNING
             meta.updated_at_ms = int((t0 + 15 * 60 + 30) * 1000)
             runner.poll_once(now_ts=t0 + 15 * 60 + 30)
@@ -862,7 +873,7 @@ class TestWatchdog(unittest.TestCase):
             r4 = runner.poll_once(now_ts=t0 + 16 * 60)
             self.assertEqual(r4["event_count"], 1)
             self.assertEqual(r4["events"][0]["event"], "error")
-            self.assertEqual(len(sent), 2)
+            self.assertEqual(len(sent), 4)
 
     def test_debounce_suppresses_transient_flapping_and_confirms_persistent_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1700,9 +1711,9 @@ async function reqJson(port, method, route, token, body) {
 
 
 class TestMcpStdioHandshake(unittest.TestCase):
-    """Verify real MCP stdio protocol handshake discovers all 15 tools."""
+    """Verify real MCP stdio protocol handshake discovers all 20 tools."""
 
-    def test_mcp_stdio_lists_all_15_tools_and_calls_overview_and_watch_list(self) -> None:
+    def test_mcp_stdio_lists_all_20_tools_and_calls_overview_and_watch_list(self) -> None:
         from mcp.client.session import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -1712,6 +1723,8 @@ class TestMcpStdioHandshake(unittest.TestCase):
             "hub_list_sessions",
             "hub_search_sessions",
             "hub_read_session",
+            "hub_summarize_session",
+            "hub_handover_session",
             "hub_bind_task",
             "hub_list_bindings",
             "hub_unbind_task",
@@ -1719,6 +1732,9 @@ class TestMcpStdioHandshake(unittest.TestCase):
             "hub_send_message",
             "hub_relay_message",
             "hub_create_session",
+            "hub_respond_approval",
+            "hub_cancel_session",
+            "hub_audit_recent",
             "hub_watch_add",
             "hub_watch_list",
             "hub_watch_remove",
@@ -1744,12 +1760,15 @@ class TestMcpStdioHandshake(unittest.TestCase):
                         tools_by_name = {t.name: t for t in tools_resp.tools}
                         self.assertEqual(set(tools_by_name.keys()), expected_tools)
 
-                        for tool_name in ("hub_send_message", "hub_create_session"):
+                        for tool_name in ("hub_send_message", "hub_relay_message", "hub_create_session"):
                             props = (tools_by_name[tool_name].input_schema or {}).get("properties") or {}
                             for param in ("model", "provider", "reasoning_effort"):
                                 self.assertIn(param, props, f"{tool_name} missing {param} in MCP schema")
+                        relay_props = (tools_by_name["hub_relay_message"].input_schema or {}).get("properties") or {}
+                        self.assertIn("mode", relay_props)
                         create_props = (tools_by_name["hub_create_session"].input_schema or {}).get("properties") or {}
                         self.assertIn("agent_preset", create_props)
+                        self.assertIn("watch", create_props)
 
                         ov_resp = await session.call_tool("hub_overview", {"limit_per_app": 1})
                         self.assertFalse(ov_resp.is_error)
@@ -1765,6 +1784,11 @@ class TestMcpStdioHandshake(unittest.TestCase):
                         self.assertFalse(wl_resp.is_error)
                         wl_parsed = json.loads(wl_resp.content[0].text)
                         self.assertEqual(wl_parsed["count"], 0)
+
+                        ar_resp = await session.call_tool("hub_audit_recent", {"limit": 5})
+                        self.assertFalse(ar_resp.is_error)
+                        ar_parsed = json.loads(ar_resp.content[0].text)
+                        self.assertEqual(ar_parsed["count"], 0)
 
         asyncio.run(_probe())
 
@@ -2581,6 +2605,833 @@ class TestModelPassthroughAndCdpCreate(unittest.TestCase):
             self.assertEqual(cx_res["verified_session_id"], "cccccccc-3333-4333-8333-333333333333")
             self.assertEqual(cx_res["verified_title"], "Branch · Class B")
             self.assertTrue(any(c["method"] == "Input.insertText" and "Codex" in c["params"]["text"] for c in calls))
+
+
+class TestEvolutionSprintFeatures(unittest.TestCase):
+    """Verify completion summary cards, watchdog hardening, approval statuses, DSH tail reads, and remote approval."""
+
+    def test_completion_summary_card_and_handover_tools(self) -> None:
+        from agent_hub.watcher import extract_task_completion_summary
+
+        msgs = [
+            {"index": 1, "role": "user", "content": "旧轮次需求：先搭个雏形"},
+            {"index": 2, "role": "assistant", "content": "已完成雏形并验证旧版本。"},
+            {
+                "index": 3,
+                "role": "user",
+                "content": "[via Hermes]\n\n请修复 watcher 冷却逻辑并生成 VSIX 包，然后跑全量单测",
+            },
+            {
+                "index": 4,
+                "role": "tool",
+                "content": "[fileChange status=completed] agent_hub/watcher.py, vscode_cline_bridge/extension.js",
+            },
+            {
+                "index": 5,
+                "role": "tool",
+                "content": "[command status=completed exit=0] python -m unittest discover -s tests -v",
+            },
+            {
+                "index": 6,
+                "role": "assistant",
+                "content": (
+                    "收到，已处理完成。\n\n"
+                    "## 实质改动\n"
+                    "- 修复 `agent_hub/watcher.py` 按事件类型隔离冷却时间并增加 flock 并发锁\n"
+                    "- 在 `vscode_cline_bridge/extension.js` 新增 `/approve` 与 `/cancel` 路由\n"
+                    "- Built `vscode_cline_bridge/agent-hub-cline-bridge-0.1.0.vsix` (8265 bytes)\n\n"
+                    "## 验证结果\n"
+                    "- Ran 40 tests in 11.2s OK\n"
+                ),
+            },
+        ]
+
+        summary = extract_task_completion_summary(
+            session_meta=SessionSummary(
+                app="codex",
+                session_id="s-sum-1",
+                title="Watcher Hardening",
+                workspace="/tmp/agent-hub-mcp",
+                status=STATUS_IDLE,
+                updated_at_ms=2_000_000_000_000,
+            ),
+            messages=msgs,
+        )
+        self.assertIn("修复 watcher 冷却逻辑", summary["objective"])
+        self.assertNotIn("[via Hermes]", summary["objective"])
+        self.assertTrue(any("watcher.py" in a for a in summary["actions"]))
+        self.assertTrue(any("Ran 40 tests" in v or "exit=0" in v for v in summary["verification"]))
+        self.assertIn("agent_hub/watcher.py", summary["modified_files"])
+        self.assertIn("**【任务目标】**", summary["markdown_card"])
+        self.assertIn("**【实质变更与动作】**", summary["markdown_card"])
+        self.assertIn("**【验证结果与产物】**", summary["markdown_card"])
+        self.assertIn("# 跨端任务交接包", summary["handover_prompt"])
+
+        # Do NOT fabricate test results when none appear in the round
+        plain_sum = extract_task_completion_summary(
+            session_meta=SessionSummary(app="dsh", session_id="d-plain", title="Plan Only", status=STATUS_IDLE),
+            messages=[
+                {"index": 1, "role": "user", "content": "梳理架构方案"},
+                {"index": 2, "role": "assistant", "content": "- 建议拆分三阶段路线图\n- 明确风险边界"},
+            ],
+        )
+        self.assertEqual(plain_sum["verification"], [])
+        self.assertIn("未检测到显式测试或构建输出", plain_sum["results"][0])
+
+        # Watchdog pushes structured card on `completed` and watch aliases resolve in HubService
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            meta = SessionSummary(
+                app="codex",
+                session_id="s-sum-1",
+                title="Watcher Hardening",
+                workspace="/tmp/agent-hub-mcp",
+                status=STATUS_IDLE,
+                updated_at_ms=2_000_000_000_000,
+            )
+
+            class _RichFakeAdapter(_FakeAdapter):
+                def read_session(self, session_id: str, **kwargs):  # noqa: ANN003
+                    return {
+                        "session": self.summary.to_dict(),
+                        "message_count_returned": len(msgs),
+                        "messages": msgs,
+                    }
+
+            adapter = _RichFakeAdapter("codex", meta)
+            wstore = WatchStore(td_path / "watches.json")
+            wstore.upsert(
+                {
+                    "alias": "汇报测试",
+                    "app": "codex",
+                    "session_id": "s-sum-1",
+                    "notify_targets": ["qqbot"],
+                    "enabled": True,
+                    "last_status": STATUS_RUNNING,
+                }
+            )
+            sent: list[tuple[str, str]] = []
+            runner = WatchdogRunner(
+                adapters={"codex": adapter},
+                store=wstore,
+                notifier=lambda t, m: (sent.append((t, m)) or (True, "ok")),
+            )
+            poll_res = runner.poll_once(now_ts=2_000_000_050.0)
+            self.assertEqual(poll_res["event_count"], 1)
+            pushed = sent[0][1]
+            self.assertIn("回合完毕 / 等待输入", pushed)
+            self.assertIn("**【任务目标】**", pushed)
+            self.assertIn("**【实质变更与动作】**", pushed)
+            self.assertIn("**【验证结果与产物】**", pushed)
+            self.assertIn("completion_summary", poll_res["events"][0])
+
+            svc = HubService(
+                adapters={
+                    "codex": adapter,
+                    "dsh": _FakeAdapter("dsh", meta),
+                    "antigravity": _FakeAdapter("antigravity", meta),
+                    "cline": _FakeAdapter("cline", meta),
+                },
+                bindings=BindingStore(td_path / "bindings.json"),
+                audit=AuditLog(td_path / "audit.jsonl"),
+                watches=wstore,
+            )
+            sum_via_watch_alias = svc.summarize_session("alias", "汇报测试")
+            self.assertTrue(sum_via_watch_alias["ok"])
+            self.assertEqual(sum_via_watch_alias["session_id"], "s-sum-1")
+            ho = svc.handover_session("all", "汇报测试", target_hint="交给 DSH 复核")
+            self.assertTrue(ho["ok"])
+            self.assertIn("交给 DSH 复核", ho["handover_prompt"])
+
+    def test_watchdog_channel_auto_fallback_and_anti_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            wstore = WatchStore(Path(td) / "watches.json")
+            now = 2_000_000_000.0
+            meta = SessionSummary(
+                app="dsh",
+                session_id="s-fb-1",
+                title="Fallback Test",
+                status=STATUS_IDLE,
+                updated_at_ms=int(now * 1000),
+            )
+            adapter = _FakeAdapter("dsh", meta, last_msg="完成所有计算。")
+            attempts: list[str] = []
+            fail_cfg = {"weixin": True, "qqbot": True}
+
+            def mock_send(target: str, _msg: str) -> tuple[bool, str]:
+                attempts.append(target)
+                if fail_cfg.get(target):
+                    return False, f"{target} failed (ret=-2)"
+                return True, f"sent via {target}"
+
+            wstore.upsert(
+                {
+                    "alias": "防丢降级",
+                    "app": "dsh",
+                    "session_id": "s-fb-1",
+                    "notify_targets": ["weixin"],
+                    "enabled": True,
+                    "last_status": STATUS_RUNNING,
+                }
+            )
+            runner = WatchdogRunner(adapters={"dsh": adapter}, store=wstore, notifier=mock_send)
+
+            # Case 1: Both weixin and fallback qqbot fail -> MUST NOT advance last_status or last_notified_at
+            r_fail = runner.poll_once(now_ts=now + 10)
+            self.assertEqual(r_fail["event_count"], 1)
+            self.assertFalse(r_fail["events"][0]["delivered"])
+            self.assertEqual(attempts, ["weixin", "qqbot"])
+            stored_fail = wstore.list_all()[0]
+            self.assertEqual(stored_fail["last_status"], STATUS_RUNNING)
+            self.assertEqual(stored_fail.get("last_notified_at", 0), 0)
+            self.assertEqual(stored_fail.get("last_notified_event", ""), "")
+            self.assertIn("last_delivery_error", stored_fail)
+
+            # Case 2: Next poll with qqbot healthy retries and succeeds via auto-fallback
+            attempts.clear()
+            fail_cfg["qqbot"] = False
+            r_ok = runner.poll_once(now_ts=now + 35)
+            self.assertEqual(r_ok["event_count"], 1)
+            self.assertTrue(r_ok["events"][0]["delivered"])
+            self.assertEqual(attempts, ["weixin", "qqbot"])
+            self.assertEqual(
+                [d["target"] for d in r_ok["events"][0]["deliveries"]],
+                ["weixin", "qqbot"],
+            )
+            self.assertTrue(r_ok["events"][0]["deliveries"][1]["fallback"])
+            stored_ok = wstore.list_all()[0]
+            self.assertEqual(stored_ok["last_status"], STATUS_IDLE)
+            self.assertEqual(stored_ok["last_notified_event"], "completed")
+            self.assertGreater(stored_ok["last_notified_at"], 0)
+            self.assertNotIn("last_delivery_error", stored_ok)
+
+    def test_watch_store_flock_concurrent_merge_preserves_external_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            wstore = WatchStore(Path(td) / "watches.json")
+            now = 2_000_000_000.0
+            m1 = SessionSummary(app="codex", session_id="s-lock-1", title="Lock 1", status=STATUS_IDLE, updated_at_ms=int(now * 1000))
+            m_rm = SessionSummary(app="codex", session_id="s-lock-rm", title="Removed", status=STATUS_RUNNING, updated_at_ms=int(now * 1000))
+
+            wstore.upsert(
+                {
+                    "watch_id": "w-1",
+                    "alias": "保留任务",
+                    "app": "codex",
+                    "session_id": "s-lock-1",
+                    "notify_targets": ["weixin"],
+                    "enabled": True,
+                    "last_status": STATUS_RUNNING,
+                }
+            )
+            wstore.upsert(
+                {
+                    "watch_id": "w-rm",
+                    "alias": "将被移除",
+                    "app": "codex",
+                    "session_id": "s-lock-rm",
+                    "notify_targets": ["weixin"],
+                    "enabled": True,
+                    "last_status": STATUS_RUNNING,
+                }
+            )
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def slow_verifier(_ctx: dict) -> dict:
+                entered.set()
+                release.wait(timeout=5.0)
+                return {
+                    "ok": True,
+                    "classification": "completed",
+                    "needs_attention": True,
+                    "label": "回合完毕 / 等待输入",
+                    "summary": "并发核验完成",
+                }
+
+            class _MapAdapter:
+                app_name = "codex"
+
+                def get_session_meta(self, sid: str) -> SessionSummary | None:
+                    return {"s-lock-1": m1, "s-lock-rm": m_rm}.get(sid)
+
+                def read_session(self, sid: str, **kwargs):  # noqa: ANN003
+                    return {"session": m1.to_dict(), "message_count_returned": 1, "messages": [{"index": 1, "role": "assistant", "content": "done"}]}
+
+            runner = WatchdogRunner(
+                adapters={"codex": _MapAdapter()},
+                store=wstore,
+                notifier=lambda t, m: (True, "ok"),
+                verifier=slow_verifier,
+                verify_agent=True,
+            )
+
+            poll_result: dict = {}
+
+            def _run_poll() -> None:
+                poll_result["res"] = runner.poll_once(now_ts=now + 10)
+
+            t = threading.Thread(target=_run_poll)
+            t.start()
+            self.assertTrue(entered.wait(timeout=3.0))
+
+            # Concurrently mutate WatchStore while poll_once is waiting inside Level-2 verifier
+            wstore.upsert(
+                {
+                    "watch_id": "w-1",
+                    "alias": "保留任务",
+                    "app": "codex",
+                    "session_id": "s-lock-1",
+                    "notify_targets": ["qqbot", "weixin"],
+                    "enabled": True,
+                }
+            )
+            wstore.upsert(
+                {
+                    "watch_id": "w-new",
+                    "alias": "并发新增",
+                    "app": "codex",
+                    "session_id": "s-lock-new",
+                    "notify_targets": ["qqbot"],
+                    "enabled": True,
+                    "last_status": STATUS_RUNNING,
+                }
+            )
+            wstore.remove("w-rm")
+            release.set()
+            t.join(timeout=5.0)
+
+            after = {w["watch_id"]: w for w in wstore.list_all()}
+            self.assertIn("w-new", after)
+            self.assertNotIn("w-rm", after)
+            self.assertIn("w-1", after)
+            self.assertEqual(after["w-1"]["notify_targets"], ["qqbot", "weixin"])
+            self.assertEqual(after["w-1"]["last_status"], STATUS_IDLE)
+            self.assertEqual(after["w-1"]["last_verification"]["summary"], "并发核验完成")
+
+    def test_four_app_approval_status_and_antigravity_subagents(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            # 1. Codex waiting_approval on inProgress commandExecution / approvalRequest
+            cx_dir = root / "codex"
+            cx_dir.mkdir(parents=True)
+            st_con = sqlite3.connect(cx_dir / "state_5.sqlite")
+            st_con.execute(
+                """
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, title TEXT, name TEXT, preview TEXT, first_user_message TEXT,
+                    cwd TEXT, updated_at INTEGER, updated_at_ms INTEGER, recency_at_ms INTEGER,
+                    archived INTEGER, is_pinned INTEGER, source TEXT, thread_source TEXT,
+                    attached_thread_parent_id TEXT, model TEXT, model_provider TEXT, reasoning_effort TEXT
+                )
+                """
+            )
+            st_con.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'desktop', NULL, NULL, 'o3', 'openai', 'high')",
+                [
+                    ("cx-ap-cmd", "Cmd Approval", "Cmd Approval", "p", "u", "/tmp", 1700000000, 1700000000000, 1700000000000),
+                    ("cx-ap-req", "Req Approval", "Req Approval", "p", "u", "/tmp", 1700000001, 1700000001000, 1700000001000),
+                ],
+            )
+            st_con.commit()
+            st_con.close()
+
+            h_con = sqlite3.connect(cx_dir / "thread_history_1.sqlite")
+            h_con.execute("CREATE TABLE thread_turns (thread_id TEXT, rollout_ordinal INTEGER, status TEXT, error_json TEXT, started_at TEXT, completed_at TEXT)")
+            h_con.execute("CREATE TABLE thread_items (thread_id TEXT, rollout_ordinal INTEGER, item_type TEXT, item_json TEXT, created_at_ms INTEGER)")
+            h_con.executemany(
+                "INSERT INTO thread_turns VALUES (?, 1, 'inProgress', NULL, '2026-11-24T00:00:00Z', NULL)",
+                [("cx-ap-cmd",), ("cx-ap-req",)],
+            )
+            h_con.execute(
+                "INSERT INTO thread_items VALUES ('cx-ap-cmd', 2, 'commandExecution', ?, 1700000000000)",
+                (json.dumps({"command": "rm -rf build/", "status": "waiting_approval"}),),
+            )
+            h_con.execute(
+                "INSERT INTO thread_items VALUES ('cx-ap-req', 2, 'approvalRequest', ?, 1700000001000)",
+                (json.dumps({"tool": "run_command", "reason": "needs confirm"}),),
+            )
+            h_con.commit()
+            h_con.close()
+
+            cx_adapter = CodexAdapter(codex_dir=cx_dir)
+            self.assertEqual(cx_adapter.get_session_meta("cx-ap-cmd").status, STATUS_WAITING_APPROVAL)
+            self.assertEqual(cx_adapter.get_session_meta("cx-ap-req").status, STATUS_WAITING_APPROVAL)
+
+            # 2. Cline waiting_approval / waiting_user across ui_messages.json and messages.json
+            cl_dir = root / "cline"
+            (cl_dir / "data" / "db").mkdir(parents=True)
+            (cl_dir / "data" / "sessions").mkdir(parents=True)
+            vsc_dir = root / "vsc_tasks"
+            (vsc_dir / "task-ui-cmd").mkdir(parents=True)
+            (vsc_dir / "task-ui-cmd" / "ui_messages.json").write_text(
+                json.dumps(
+                    [
+                        {"type": "say", "say": "text", "text": "Initial task"},
+                        {"type": "ask", "ask": "command", "text": "sbatch job.sh"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (vsc_dir / "task-ui-follow").mkdir(parents=True)
+            (vsc_dir / "task-ui-follow" / "ui_messages.json").write_text(
+                json.dumps(
+                    [
+                        {"type": "say", "say": "text", "text": "Question"},
+                        {"type": "ask", "ask": "followup", "text": "选哪个参数？"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            msg_ap_path = cl_dir / "data" / "sessions" / "s-msg-ap.json"
+            msg_ap_path.write_text(
+                json.dumps({"messages": [{"role": "assistant", "type": "ask", "ask": "tool", "approval_pending": True, "text": "write file"}]}),
+                encoding="utf-8",
+            )
+            cl_con = sqlite3.connect(cl_dir / "data" / "db" / "sessions.db")
+            cl_con.execute(
+                """
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY, source TEXT, pid INTEGER, started_at TEXT,
+                    ended_at TEXT, exit_code INTEGER, status TEXT, status_message TEXT,
+                    cwd TEXT, workspace_root TEXT, prompt TEXT, metadata_json TEXT,
+                    messages_path TEXT, transcript_path TEXT, updated_at TEXT,
+                    is_subagent INTEGER, model TEXT, provider TEXT
+                )
+                """
+            )
+            cl_con.execute(
+                "INSERT INTO sessions VALUES ('s-msg-ap', 'vscode', 1, '2026-11-24T00:00:00Z', NULL, NULL, 'running', '', '/tmp', '/tmp', 'p', '{}', ?, '', '2026-11-24T00:01:00Z', 0, 'm', 'p')",
+                (str(msg_ap_path),),
+            )
+            cl_con.commit()
+            cl_con.close()
+
+            cl_adapter = ClineAdapter(cline_dir=cl_dir, vscode_tasks_dir=vsc_dir)
+            self.assertEqual(cl_adapter.get_session_meta("task-ui-cmd").status, STATUS_WAITING_APPROVAL)
+            self.assertEqual(cl_adapter.get_session_meta("task-ui-follow").status, STATUS_WAITING_USER)
+            self.assertEqual(cl_adapter.get_session_meta("s-msg-ap").status, STATUS_WAITING_APPROVAL)
+
+            # 3. Antigravity approval, ask_question, error vs recovered-DONE, and subagent filter
+            ag_dir = root / "antigravity"
+            ag_dir.mkdir(parents=True)
+            ag_con = sqlite3.connect(ag_dir / "conversation_summaries.db")
+            ag_con.execute(
+                """
+                CREATE TABLE conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT,
+                    step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT,
+                    status TEXT, not_fully_idle INTEGER, killed INTEGER,
+                    parent_conversation_id TEXT
+                )
+                """
+            )
+            ag_con.executemany(
+                "INSERT INTO conversation_summaries VALUES (?, ?, ?, 5, ?, '[]', 'CASCADE_RUN_STATUS_IDLE', 0, 0, ?)",
+                [
+                    ("ag-req-ap", "Plan Feedback", "p", "2026-11-24T05:00:00Z", ""),
+                    ("ag-ask-q", "Ask User", "p", "2026-11-24T04:00:00Z", ""),
+                    ("ag-err", "Step Error", "p", "2026-11-24T03:00:00Z", ""),
+                    ("ag-recovered", "Recovered", "p", "2026-11-24T02:00:00Z", ""),
+                    ("ag-sub", "Subagent", "p", "2026-11-24T01:00:00Z", "ag-req-ap"),
+                ],
+            )
+            ag_con.commit()
+            ag_con.close()
+
+            def _write_transcript(cid: str, entries: list[dict]) -> None:
+                p = ag_dir / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+
+            _write_transcript(
+                "ag-req-ap",
+                [
+                    {
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "content": "Plan ready",
+                        "tool_calls": [{"name": "write_file", "arguments": {"ArtifactMetadata": {"RequestFeedback": True}}}],
+                    }
+                ],
+            )
+            _write_transcript(
+                "ag-ask-q",
+                [{"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Pick one", "tool_calls": [{"name": "ask_question"}]}],
+            )
+            _write_transcript("ag-err", [{"type": "ERROR_MESSAGE", "status": "DONE", "content": "Quota exhausted"}])
+            _write_transcript(
+                "ag-recovered",
+                [
+                    {"type": "GENERIC", "status": "ERROR", "content": "transient"},
+                    {"type": "PLANNER_RESPONSE", "status": "DONE", "content": "Recovered cleanly"},
+                ],
+            )
+
+            ag_adapter = AntigravityAdapter(antigravity_dir=ag_dir)
+            self.assertEqual(ag_adapter.get_session_meta("ag-req-ap").status, STATUS_WAITING_APPROVAL)
+            self.assertEqual(ag_adapter.get_session_meta("ag-ask-q").status, STATUS_WAITING_USER)
+            self.assertEqual(ag_adapter.get_session_meta("ag-err").status, STATUS_ERROR)
+            self.assertEqual(ag_adapter.get_session_meta("ag-recovered").status, STATUS_IDLE)
+            listed_default = [s.session_id for s in ag_adapter.list_sessions(limit=20, include_subagents=False)]
+            self.assertNotIn("ag-sub", listed_default)
+            listed_with_sub = [s.session_id for s in ag_adapter.list_sessions(limit=20, include_subagents=True)]
+            self.assertIn("ag-sub", listed_with_sub)
+
+    def test_dsh_read_session_tail_frames_and_budget_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            harness = Path(td)
+            zdir = harness / "sessions" / "ws" / "session-big-tail"
+            zdir.mkdir(parents=True)
+            zpath = zdir / "session.v4.jsonl.zstd"
+
+            # Build 20 independent zstd frames (realistic append-only DSH session log)
+            frames = bytearray()
+            for i in range(20):
+                line = json.dumps(
+                    {
+                        "seq": i + 1,
+                        "type": "user/message" if i % 2 == 0 else "assistant/message",
+                        "time": f"2026-11-24T01:{i:02d}:00Z",
+                        "data": (
+                            {"content": [{"type": "text", "text": f"turn-{i} " + ("x" * 180)}]}
+                            if i % 2 == 0
+                            else {"message": {"content": [{"type": "text", "text": f"turn-{i} " + ("y" * 180)}]}}
+                        ),
+                    }
+                ) + "\n"
+                frames.extend(zstd.compress(line.encode("utf-8")))
+            zpath.write_bytes(bytes(frames))
+
+            pc_dir = harness / "storages" / "session_projcache" / "sessions"
+            pc_dir.mkdir(parents=True)
+            (pc_dir / "session-big-tail.json").write_text(
+                json.dumps({"record": {"identity": {"cwd": "/tmp"}, "rows": {"title": {"val": "Big Tail"}}}}),
+                encoding="utf-8",
+            )
+
+            adapter = DshAdapter(harness_dir=harness)
+            # Tail budget covers final ~3-4 frames -> returns latest 2 without full decompression
+            r_small = adapter.read_session("session-big-tail", tail_messages=2, tail_budget_bytes=280)
+            self.assertEqual([m["index"] for m in r_small["messages"]], [19, 20])
+
+            # Larger tail_messages=10 triggers automatic budget escalation / full fallback cleanly
+            r_escalate = adapter.read_session("session-big-tail", tail_messages=10, tail_budget_bytes=280)
+            self.assertEqual(len(r_escalate["messages"]), 10)
+            self.assertEqual(r_escalate["messages"][-1]["index"], 20)
+
+    def test_remote_approval_cancel_and_audit_recent_across_bridges(self) -> None:
+        # 1. Node integration test for Cline extension.js /approve, /cancel, /new-task, and port registry
+        ext_path = Path(__file__).resolve().parent.parent / "vscode_cline_bridge" / "extension.js"
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            node_script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const http = require('node:http');
+const Module = require('node:module');
+const path = require('node:path');
+
+const tmpDir = process.argv[2];
+process.env.AGENT_HUB_CLINE_BRIDGE_STATE_PATH = path.join(tmpDir, 'cline-bridge.json');
+process.env.AGENT_HUB_CLINE_BRIDGE_TOKEN_PATH = path.join(tmpDir, 'cline-bridge.token');
+
+const events = [];
+const state = {
+  controller: {
+    task: {
+      ulid: 'task-ap-1',
+      taskId: 'task-ap-1',
+      messageStateHandler: {
+        messages: [{ type: 'ask', ask: 'command', text: 'pytest -q', ts: 123456 }],
+      },
+      async handleWebviewAskResponse(kind, text) {
+        events.push('resp:' + kind + ':' + text);
+      },
+    },
+    async showTaskWithId(id) {
+      if (id !== 'task-ap-1') throw new Error('missing ' + id);
+    },
+    async initTask(prompt) {
+      events.push('init:' + prompt);
+    },
+    async clearTask() {},
+    async postStateToWebview() {},
+    async cancelTask() {
+      events.push('cancelTask');
+    },
+  },
+};
+const clineApi = {
+  startNewTask: async (prompt) => {
+    setTimeout(() => {
+      state.controller.task = {
+        ulid: 'async-task-77',
+        taskId: 'async-task-77',
+        messageStateHandler: { messages: [] },
+        async handleWebviewAskResponse() {},
+      };
+    }, 30);
+    events.push('startNew:' + prompt);
+  },
+  sendMessage: async (msg) => {
+    if (state.controller.task) await state.controller.task.handleWebviewAskResponse('messageResponse', msg);
+  },
+  pressPrimaryButton: async () => {
+    events.push('primary');
+    if (state.controller.task) await state.controller.task.handleWebviewAskResponse('yesButtonClicked', '');
+  },
+  pressSecondaryButton: async () => {
+    events.push('secondary');
+    if (state.controller.task) await state.controller.task.handleWebviewAskResponse('noButtonClicked', '');
+  },
+};
+// Ensure inspector closes over state.controller
+clineApi.sendMessage = ((t) => async (r) => { if (t.task) await t.task.handleWebviewAskResponse('messageResponse', r); })(state.controller);
+
+const origLoad = Module._load;
+Module._load = function(request) {
+  if (request === 'vscode') {
+    return {
+      workspace: { workspaceFolders: [{ uri: { fsPath: '/flash/grp/xxllab/shennq' } }] },
+      extensions: { getExtension: () => ({ isActive: true, exports: clineApi }) },
+      commands: { executeCommand: async () => {} },
+    };
+  }
+  return origLoad.apply(this, arguments);
+};
+
+const bridge = require(process.argv[1]);
+const { createRequestHandler } = bridge._internals;
+
+async function reqJson(port, method, route, token, body) {
+  const rawBody = body ? JSON.stringify(body) : null;
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1', port, path: route, method,
+        headers: {
+          Authorization: 'Bearer ' + token,
+          ...(rawBody ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(rawBody) } : {}),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+      }
+    );
+    req.on('error', reject);
+    if (rawBody) req.write(rawBody);
+    req.end();
+  });
+}
+
+(async () => {
+  const tok = 'd'.repeat(64);
+  let boundPort = 0;
+  const handler = createRequestHandler({
+    token: tok,
+    getPort: () => boundPort,
+    getClineApiImpl: async () => ({ installed: true, active: true, api: clineApi }),
+    executeCommandImpl: async () => {},
+    getWorkspacesImpl: () => ['/flash/grp/xxllab/shennq'],
+    sidebarFocusDelayMs: 5,
+    postActivateSettleMs: 5,
+    waitForActiveTaskTimeoutMs: 500,
+  });
+  const srv = http.createServer(handler);
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  boundPort = srv.address().port;
+  try {
+    const h = await reqJson(boundPort, 'GET', '/health', tok);
+    assert.equal(h.status, 200);
+    assert.equal(h.body.hasPressPrimaryButton, true);
+    assert.equal(h.body.hasCancelTask, true);
+    assert.equal(h.body.pendingAsk.ask, 'command');
+
+    const apYes = await reqJson(boundPort, 'POST', '/approve', tok, { sessionId: 'task-ap-1', decision: 'yes' });
+    assert.equal(apYes.status, 200);
+    assert.equal(apYes.body.decision, 'yes');
+    assert.ok(events.includes('primary'));
+
+    const apNo = await reqJson(boundPort, 'POST', '/approve', tok, { sessionId: 'task-ap-1', decision: 'no', feedback: '改为只读命令' });
+    assert.equal(apNo.status, 200);
+    assert.ok(events.includes('resp:noButtonClicked:改为只读命令'));
+
+    const apBad = await reqJson(boundPort, 'POST', '/approve', tok, { sessionId: 'wrong-id', decision: 'yes' });
+    assert.equal(apBad.status, 500);
+    assert.equal(apBad.body.error_code, 'session_mismatch');
+
+    const can = await reqJson(boundPort, 'POST', '/cancel', tok, { sessionId: 'task-ap-1' });
+    assert.equal(can.status, 200);
+    assert.ok(events.includes('cancelTask'));
+
+    // Test /new-task waits for async task assignment
+    state.controller.task = null;
+    const nt = await reqJson(boundPort, 'POST', '/new-task', tok, { text: 'delayed task' });
+    assert.equal(nt.status, 200);
+    assert.equal(nt.body.sessionId, 'async-task-77');
+  } finally {
+    srv.close();
+  }
+})();
+"""
+            proc = subprocess.run(["node", "-e", node_script, str(ext_path), td], capture_output=True, text=True, timeout=20)
+            self.assertEqual(proc.returncode, 0, f"Node approval/cancel test failed:\n{proc.stdout}\n{proc.stderr}")
+
+            # 2. ClineWriter multi-window workspace routing + SessionMismatchError
+            reg_dir = td_path / "cline-bridges"
+            reg_dir.mkdir(parents=True)
+            (reg_dir / "port-43918.json").write_text(json.dumps({"port": 43918, "workspaces": ["/tmp/ws-a"]}), encoding="utf-8")
+            (reg_dir / "port-43919.json").write_text(json.dumps({"port": 43919, "workspaces": ["/flash/grp/xxllab/shennq"]}), encoding="utf-8")
+            (td_path / "cline-bridge.token").write_text("x" * 64 + "\n", encoding="utf-8")
+            cw = ClineWriter(token_path=td_path / "cline-bridge.token", state_path=td_path / "cline-bridge.json")
+            self.assertEqual(
+                [e["port"] for e in cw._candidate_bridge_entries(workspace="/flash/grp/xxllab/shennq")][0],
+                43919,
+            )
+
+        # 3. CdpWriter splash filter, respond_approval (mismatch guard + click), cancel_session
+        codex_w = CodexWriter()
+        raw_targets = [
+            {"type": "page", "url": "data:text/html;charset=utf-8,<svg>splash</svg>", "title": "data:text/html", "webSocketDebuggerUrl": "ws://127.0.0.1:9224/1"},
+            {"type": "page", "url": "app://-/index.html?initialRoute=%2Favatar-overlay", "title": "Overlay", "webSocketDebuggerUrl": "ws://127.0.0.1:9224/2"},
+            {"type": "page", "url": "app://-/index.html", "title": "ChatGPT", "webSocketDebuggerUrl": "ws://127.0.0.1:9224/3"},
+        ]
+        with patch.object(CdpWriter, "_fetch_targets", return_value=raw_targets):
+            port, pages = codex_w._discover_endpoint()
+            self.assertEqual(port, 9222)
+            self.assertEqual([p["title"] for p in pages], ["ChatGPT"])
+
+        cdp_calls: list[dict] = []
+        cdp_state = {"sid": "ag-ap-1", "clicked": ""}
+
+        class _FakeApprovalWS:
+            def __init__(self, url: str, timeout: float = 15.0) -> None:  # noqa: ARG002
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):  # noqa: ANN002
+                return False
+
+            def send_text(self, raw: str) -> None:
+                cdp_calls.append(json.loads(raw))
+
+            def recv_text(self) -> str:
+                last = cdp_calls[-1]
+                cid = last["id"]
+                expr = (last.get("params") or {}).get("expression", "")
+                if "__agentHubReadSessionIdentity" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {
+                                "result": {
+                                    "value": {
+                                        "sessionId": cdp_state["sid"],
+                                        "title": "AG Task",
+                                        "href": f"https://127.0.0.1:52123/c/{cdp_state['sid']}",
+                                        "pathname": f"/c/{cdp_state['sid']}",
+                                        "source": "pathname",
+                                    }
+                                }
+                            },
+                        }
+                    )
+                if "findBySessionId" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "switched": False}}}})
+                if "__agentHubRespondApproval" in expr:
+                    cdp_state["clicked"] = "Approve"
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "clicked_label": "Approve"}}}})
+                if "__agentHubCancelSession" in expr:
+                    cdp_state["clicked"] = "Stop"
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "clicked_label": "Stop"}}}})
+                return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch("agent_hub.writers.cdp_writer.SimpleWebSocket", _FakeApprovalWS),
+            patch.object(CdpWriter, "_discover_endpoint", return_value=(9224, [{"title": "Antigravity", "url": "https://127.0.0.1:52123/c/ag-ap-1", "webSocketDebuggerUrl": "ws://127.0.0.1:9224/p1"}])),
+        ):
+            ag_w = AntigravityWriter()
+            ag_w.switch_verify_timeout_s = 0.05
+            ag_w.switch_poll_interval_s = 0.01
+            ok_ap = ag_w.respond_approval("ag-ap-1", "同意", target_title="AG Task")
+            self.assertEqual(ok_ap["decision"], "yes")
+            self.assertEqual(ok_ap["clicked_label"], "Approve")
+
+            # Mismatch refuses click
+            cdp_calls.clear()
+            cdp_state["sid"] = "different-session-9"
+            with self.assertRaises(SessionMismatchError):
+                ag_w.respond_approval("ag-ap-1", "yes", target_title="AG Task")
+            self.assertFalse(any("__agentHubRespondApproval" in (c.get("params") or {}).get("expression", "") for c in cdp_calls))
+
+            # Cancel succeeds when matched
+            cdp_state["sid"] = "ag-ap-1"
+            ok_can = ag_w.cancel_session("ag-ap-1", target_title="AG Task")
+            self.assertEqual(ok_can["clicked_label"], "Stop")
+
+            # 4. HubService respond_approval, cancel_session, audit_recent, create_session(watch=True), relay_message(model=...)
+            td_path = Path(td)
+            meta_ag = SessionSummary(app="antigravity", session_id="ag-ap-1", title="AG Task", status=STATUS_WAITING_APPROVAL, updated_at_ms=2000)
+            meta_dsh = SessionSummary(app="dsh", session_id="dsh-1", title="DSH 1", status=STATUS_RUNNING, updated_at_ms=1500)
+
+            class _FullFakeWriter(_FakeWriter):
+                def respond_approval(self, sid: str, decision: str = "yes", **kwargs):  # noqa: ANN003
+                    self.calls.append({"action": "approve", "sid": sid, "decision": decision, **kwargs})
+                    return {"ok": True, "sessionId": sid, "verified_session_id": sid, "decision": decision}
+
+                def cancel_session(self, sid: str, **kwargs):  # noqa: ANN003
+                    self.calls.append({"action": "cancel", "sid": sid, **kwargs})
+                    return {"ok": True, "sessionId": sid, "verified_session_id": sid}
+
+            dsh_fw = _FullFakeWriter("dsh", ready=True, supports_create=True)
+            ag_adapter = _FakeAdapter("antigravity", meta_ag)
+            dsh_adapter = _FakeAdapter("dsh", meta_dsh)
+
+            # Ensure watch_add sees created fake-created-session-1 when create_session(watch=True) runs
+            orig_dsh_meta = dsh_adapter.get_session_meta
+            dsh_adapter.get_session_meta = lambda s: (
+                SessionSummary(app="dsh", session_id="fake-created-session-1", title="NewWatched", status=STATUS_RUNNING, updated_at_ms=2000)
+                if s == "fake-created-session-1"
+                else orig_dsh_meta(s)
+            )
+
+            svc = HubService(
+                adapters={"antigravity": ag_adapter, "dsh": dsh_adapter, "codex": _FakeAdapter("codex", meta_dsh), "cline": _FakeAdapter("cline", meta_dsh)},
+                bindings=BindingStore(td_path / "bindings.json"),
+                audit=AuditLog(td_path / "audit.jsonl"),
+                watches=WatchStore(td_path / "watches.json"),
+                writers={"antigravity": ag_w, "dsh": dsh_fw, "codex": _FakeWriter("codex"), "cline": _FakeWriter("cline")},
+            )
+            dry_ap = svc.respond_approval("antigravity", "ag-ap-1", "yes", dry_run=True)
+            self.assertTrue(dry_ap["dry_run"])
+            real_ap = svc.respond_approval("antigravity", "ag-ap-1", "同意", feedback="ok")
+            self.assertTrue(real_ap["ok"])
+            self.assertEqual(real_ap["decision"], "yes")
+
+            can_res = svc.cancel_session("dsh", "dsh-1")
+            self.assertTrue(can_res["ok"])
+
+            cr_watch = svc.create_session("dsh", title="NewWatched", initial_message="Run", watch=True, watch_alias="新建盯盘")
+            self.assertTrue(cr_watch["ok"])
+            self.assertTrue(cr_watch["watch"]["ok"])
+            self.assertEqual(cr_watch["watch"]["watch"]["alias"], "新建盯盘")
+
+            rel = svc.relay_message("antigravity", "ag-ap-1", "dsh", "dsh-1", dry_run=False, model="deepseek-reasoner", mode="steer")
+            self.assertTrue(rel["ok"])
+            self.assertEqual(rel["mode"], "steer")
+
+            aud_all = svc.audit_recent(limit=10)
+            self.assertGreaterEqual(aud_all["count"], 4)
+            aud_ap = svc.audit_recent(limit=10, app="antigravity", action="respond_approval")
+            self.assertEqual(aud_ap["count"], 1)
+            self.assertEqual(aud_ap["entries"][0]["status"], "approved")
 
 
 if __name__ == "__main__":

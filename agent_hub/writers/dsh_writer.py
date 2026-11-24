@@ -140,6 +140,37 @@ class DshWriter:
             raise RuntimeError(f"DSH bridge create rejected: {res}")
         return res
 
+    def respond_approval(self, session_id: str, decision: str = "yes", *, feedback: str = "") -> dict[str, Any]:
+        """Respond to a pending approval prompt in a DSH session."""
+        raw = (decision or "").strip().lower()
+        norm_decision = (
+            "yes"
+            if raw in ("yes", "y", "approve", "approved", "allow", "accept", "proceed", "confirm", "同意", "允许", "批准", "确认", "放行")
+            else "no"
+            if raw in ("no", "n", "reject", "rejected", "deny", "denied", "decline", "cancel", "拒绝", "不同意", "不允许", "驳回")
+            else ""
+        )
+        if not norm_decision:
+            raise ValueError(f"Invalid approval decision '{decision}'; expected 'yes' or 'no'.")
+
+        payload: dict[str, Any] = {"sessionId": session_id, "decision": norm_decision}
+        if feedback.strip():
+            payload["feedback"] = feedback.strip()
+        try:
+            res = self._request("POST", "/approve", payload, timeout=15.0)
+        except RuntimeError as exc:
+            if "HTTP 404" in str(exc):
+                raise RuntimeError(
+                    "DSH Desktop is running the previous plugin without /approve; "
+                    "restart DSH Desktop when idle to load the updated bridge plugin."
+                ) from exc
+            raise
+        if not res.get("ok"):
+            raise RuntimeError(f"DSH bridge approve rejected: {res}")
+        out = dict(res)
+        out["verified_session_id"] = str(res.get("sessionId") or session_id)
+        return out
+
     def cancel_session(self, session_id: str) -> dict[str, Any]:
         """Cancel an active turn in a DSH session."""
         res = self._request("POST", "/cancel", {"sessionId": session_id}, timeout=15.0)

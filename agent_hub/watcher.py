@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import json
 import logging
 import os
@@ -14,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import uuid
 
 from .adapters import AntigravityAdapter, ClineAdapter, CodexAdapter, DshAdapter
@@ -29,6 +31,14 @@ from .models import (
     SessionSummary,
     clean_single_line,
     truncate_text,
+)
+from .summary import (
+    BG_LABEL_RUNNING,
+    BG_LABEL_SUBMITTED,
+    detect_background_job,
+    extract_task_completion_summary,
+    format_completion_card,
+    format_handover_packet,
 )
 
 
@@ -47,6 +57,11 @@ ALL_NOTIFY_EVENTS: tuple[str, ...] = (
 DEFAULT_VERIFY_EVENTS: tuple[str, ...] = ("completed", "stalled", "error")
 DEFAULT_DAEMON_DEBOUNCE_SECONDS = 25
 DEBOUNCE_EVENTS: tuple[str, ...] = ("error", "completed")
+DEFAULT_FALLBACK_CHANNELS: dict[str, str] = {
+    "weixin": "qqbot",
+    "qqbot": "weixin",
+}
+
 _TRANSIENT_CLASSIFICATIONS: frozenset[str] = frozenset(
     {
         "transient_error",
@@ -58,9 +73,6 @@ _TRANSIENT_CLASSIFICATIONS: frozenset[str] = frozenset(
     }
 )
 
-BG_LABEL_SUBMITTED = "【已提交后台作业】"
-BG_LABEL_RUNNING = "【阶段汇报·后台作业运行中】"
-
 _EVENT_LABELS: dict[str, str] = {
     "completed": "回合完毕 / 等待输入",
     "waiting_approval": "等待审批",
@@ -70,34 +82,22 @@ _EVENT_LABELS: dict[str, str] = {
     "stalled": "疑似卡滞",
 }
 
-_BG_SUBMITTED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("submitted_batch_job", re.compile(r"\bSubmitted\s+batch\s+job\s+\d+", re.IGNORECASE)),
-    ("sbatch", re.compile(r"\bsbatch\b", re.IGNORECASE)),
-    ("cn_submitted_job", re.compile(r"已提交[^\n。；;]{0,24}(?:Slurm\s*)?(?:作业|任务|批处理|后台|job)", re.IGNORECASE)),
-    ("cn_submitted_job_le", re.compile(r"提交了[^\n。；;]{0,24}(?:Slurm\s*)?(?:作业|任务|批处理|后台|job)", re.IGNORECASE)),
-    ("en_submitted_job", re.compile(r"\bsubmitted\s+(?:a\s+)?(?:slurm|batch|background)\s+(?:job|task)s?\b", re.IGNORECASE)),
-)
-
-_BG_RUNNING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("cn_running_background", re.compile(r"正在后台")),
-    ("cn_background_active", re.compile(r"后台(?:作业|任务|进程)[^\n。；;]{0,12}(?:运行中|执行中|排队中|进行中)")),
-    ("cn_waiting_result", re.compile(r"等待[^\n。；;]{0,24}(?:出结果|跑完|运行完成|执行完成|作业完成|结束)")),
-    ("en_running_background", re.compile(r"\brunning\s+in\s+(?:the\s+)?background\b", re.IGNORECASE)),
-    ("en_background_active", re.compile(r"\bbackground\s+(?:job|task|process)\s+(?:is\s+)?(?:running|pending|queued)\b", re.IGNORECASE)),
-    ("job_state_active", re.compile(r"(?:作业|job)\s*(?:状态|state|status)\s*[:：=]?\s*(?:RUNNING|PENDING|PD\b)", re.IGNORECASE)),
-)
-
-_BG_FINISHED_OVERRIDE_RE = re.compile(
-    r"(?:作业|任务|job)\s*\d*\s*(?:已|已经)?(?:全部)?(?:运行|执行)?(?:完成|结束|跑完|成功)",
-    re.IGNORECASE,
-)
-
-_JOB_ID_RE = re.compile(
-    r"(?:Submitted\s+batch\s+job|Slurm\s*(?:作业|任务|job)|(?:作业|job)\s*(?:ID|编号|号)?)\s*[:：=#]?\s*(\d{4,12})",
-    re.IGNORECASE,
-)
-
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+_RUNTIME_WATCH_KEYS: tuple[str, ...] = (
+    "title",
+    "last_status",
+    "last_status_detail",
+    "last_updated_at_ms",
+    "last_notified_event",
+    "last_notified_at",
+    "last_notified_by_event",
+    "last_suppressed_by_event",
+    "last_stalled_updated_at_ms",
+    "pending_transition",
+    "last_verification",
+    "last_delivery_error",
+)
 
 logger = logging.getLogger("agent_hub.watcher")
 
@@ -156,53 +156,33 @@ def parse_verify_events(raw: str | list[str] | None) -> list[str]:
     return [v for v in vals if v in ALL_NOTIFY_EVENTS]
 
 
-def detect_background_job(text: str) -> dict[str, Any]:
-    """Detect async/Slurm background job submissions or active background work in text."""
-    body = str(text or "")
-    if not body.strip():
-        return {"matched": False, "kind": "", "label": "", "job_ids": [], "signals": []}
-
-    running_signals = [name for name, pat in _BG_RUNNING_PATTERNS if pat.search(body)]
-    submitted_signals = [name for name, pat in _BG_SUBMITTED_PATTERNS if pat.search(body)]
-
-    if not running_signals and not submitted_signals:
-        return {"matched": False, "kind": "", "label": "", "job_ids": [], "signals": []}
-
-    if submitted_signals and not running_signals and _BG_FINISHED_OVERRIDE_RE.search(body):
-        return {"matched": False, "kind": "", "label": "", "job_ids": [], "signals": []}
-
-    job_ids: list[str] = []
-    seen_ids: set[str] = set()
-    for match in _JOB_ID_RE.finditer(body):
-        jid = match.group(1)
-        if jid not in seen_ids:
-            seen_ids.add(jid)
-            job_ids.append(jid)
-
-    if running_signals:
-        kind = "running_background"
-        label = BG_LABEL_RUNNING
-    else:
-        kind = "submitted"
-        label = BG_LABEL_SUBMITTED
-
-    signals = running_signals + [s for s in submitted_signals if s not in running_signals]
-    return {
-        "matched": True,
-        "kind": kind,
-        "label": label,
-        "job_ids": job_ids,
-        "signals": signals,
-    }
-
-
 class WatchStore:
-    """Atomic JSON store for persistent zero-token session watches."""
+    """Process-safe flock-protected atomic JSON store for persistent zero-token session watches."""
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = _resolve_watches_path(path)
+        self._lock_path = self.path.parent / f".{self.path.name}.lock"
 
-    def list_all(self) -> list[dict[str, Any]]:
+    @contextmanager
+    def _file_lock(self, *, exclusive: bool = True) -> Iterator[None]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        with self._lock_path.open("a+", encoding="utf-8") as lock_fh:
+            try:
+                os.chmod(self._lock_path, 0o600)
+            except OSError:
+                pass
+            fcntl.flock(lock_fh.fileno(), mode)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    def _read_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         try:
@@ -213,7 +193,7 @@ class WatchStore:
             return [dict(w) for w in data["watches"] if isinstance(w, dict)]
         return []
 
-    def save_all(self, watches: list[dict[str, Any]]) -> None:
+    def _write_unlocked(self, watches: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.path.parent, 0o700)
@@ -238,31 +218,40 @@ class WatchStore:
                 except OSError:
                     pass
 
+    def list_all(self) -> list[dict[str, Any]]:
+        with self._file_lock(exclusive=False):
+            return self._read_unlocked()
+
+    def save_all(self, watches: list[dict[str, Any]]) -> None:
+        with self._file_lock(exclusive=True):
+            self._write_unlocked(watches)
+
     def upsert(self, watch: dict[str, Any]) -> dict[str, Any]:
         """Insert or update watch keyed uniquely by (app, session_id)."""
-        watches = self.list_all()
-        app = str(watch["app"])
-        sid = str(watch["session_id"])
-        for idx, existing in enumerate(watches):
-            if existing.get("app") == app and existing.get("session_id") == sid:
-                merged = dict(existing)
-                merged.update(watch)
-                if "pending_transition" in watch and watch["pending_transition"] is None:
-                    merged.pop("pending_transition", None)
-                merged["watch_id"] = existing.get("watch_id") or merged.get("watch_id") or f"w_{uuid.uuid4().hex[:8]}"
-                watches[idx] = merged
-                self.save_all(watches)
-                return merged
+        with self._file_lock(exclusive=True):
+            watches = self._read_unlocked()
+            app = str(watch["app"])
+            sid = str(watch["session_id"])
+            for idx, existing in enumerate(watches):
+                if existing.get("app") == app and existing.get("session_id") == sid:
+                    merged = dict(existing)
+                    merged.update(watch)
+                    if "pending_transition" in watch and watch["pending_transition"] is None:
+                        merged.pop("pending_transition", None)
+                    merged["watch_id"] = existing.get("watch_id") or merged.get("watch_id") or f"w_{uuid.uuid4().hex[:8]}"
+                    watches[idx] = merged
+                    self._write_unlocked(watches)
+                    return merged
 
-        new_watch = {k: v for k, v in watch.items() if not (k == "pending_transition" and v is None)}
-        new_watch.setdefault("watch_id", f"w_{uuid.uuid4().hex[:8]}")
-        new_watch.setdefault(
-            "created_at",
-            datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        )
-        watches.append(new_watch)
-        self.save_all(watches)
-        return new_watch
+            new_watch = {k: v for k, v in watch.items() if not (k == "pending_transition" and v is None)}
+            new_watch.setdefault("watch_id", f"w_{uuid.uuid4().hex[:8]}")
+            new_watch.setdefault(
+                "created_at",
+                datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            )
+            watches.append(new_watch)
+            self._write_unlocked(watches)
+            return new_watch
 
     def remove(self, key: str) -> dict[str, Any] | None:
         """Remove a watch by watch_id, alias (case-insensitive), or session_id."""
@@ -270,17 +259,73 @@ class WatchStore:
         if not target:
             return None
         t_low = target.lower()
-        watches = self.list_all()
-        for idx, w in enumerate(watches):
-            if (
-                str(w.get("watch_id", "")).lower() == t_low
-                or str(w.get("alias", "")).strip().lower() == t_low
-                or str(w.get("session_id", "")) == target
-            ):
-                removed = watches.pop(idx)
-                self.save_all(watches)
-                return removed
-        return None
+        with self._file_lock(exclusive=True):
+            watches = self._read_unlocked()
+            for idx, w in enumerate(watches):
+                if (
+                    str(w.get("watch_id", "")).lower() == t_low
+                    or str(w.get("alias", "")).strip().lower() == t_low
+                    or str(w.get("session_id", "")) == target
+                ):
+                    removed = watches.pop(idx)
+                    self._write_unlocked(watches)
+                    return removed
+            return None
+
+    def update_entries(
+        self,
+        updates_by_id: dict[str, dict[str, Any]],
+        *,
+        clear_keys_by_id: dict[str, set[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Incrementally merge runtime watch updates by watch_id under exclusive flock.
+
+        Preserves concurrent watch_add / watch_remove mutations performed while a slow
+        poll cycle (such as Level-2 agent verification) was in flight.
+        """
+        if not updates_by_id and not clear_keys_by_id:
+            return self.list_all()
+        clears = clear_keys_by_id or {}
+        with self._file_lock(exclusive=True):
+            current = self._read_unlocked()
+            changed = False
+            for idx, existing in enumerate(current):
+                wid = str(existing.get("watch_id") or "")
+                if not wid:
+                    continue
+                patch = updates_by_id.get(wid)
+                rm_keys = clears.get(wid, set())
+                if patch is None and not rm_keys:
+                    continue
+                merged = dict(existing)
+                for rk in rm_keys:
+                    if rk in merged:
+                        merged.pop(rk, None)
+                        changed = True
+                if patch:
+                    for key, val in patch.items():
+                        if key in ("last_notified_by_event", "last_suppressed_by_event") and isinstance(val, dict):
+                            cur_map = merged.get(key)
+                            new_map = dict(cur_map) if isinstance(cur_map, dict) else {}
+                            for ev, ts in val.items():
+                                try:
+                                    prev_ts = float(new_map.get(ev) or 0)
+                                    cur_ts = float(ts or 0)
+                                    if cur_ts >= prev_ts:
+                                        new_map[ev] = ts
+                                except (TypeError, ValueError):
+                                    new_map[ev] = ts
+                            if new_map != merged.get(key):
+                                merged[key] = new_map
+                                changed = True
+                        else:
+                            if merged.get(key) != val:
+                                merged[key] = val
+                                changed = True
+                current[idx] = merged
+            if changed:
+                self._write_unlocked(current)
+            return current
 
 
 def evaluate_watch(
@@ -289,7 +334,7 @@ def evaluate_watch(
     *,
     now_ts: float | None = None,
 ) -> tuple[str | None, str]:
-    """Detect whether a watched session crossed a notifiable transition."""
+    """Detect whether a watched session crossed a notifiable transition (per-event cooldown)."""
     now = time.time() if now_ts is None else float(now_ts)
     prev_status = str(watch.get("last_status") or STATUS_IDLE)
     cur_status = live_meta.status
@@ -322,13 +367,21 @@ def evaluate_watch(
         stall_min = max(1, int(watch.get("stall_minutes") or 15))
         idle_ms = int(now * 1000) - int(live_meta.updated_at_ms)
         if idle_ms >= stall_min * 60_000:
-            last_ev = str(watch.get("last_notified_event") or "")
+            sent_by_ev = watch.get("last_notified_by_event")
+            last_stalled_notif = (
+                float(sent_by_ev.get("stalled") or 0)
+                if isinstance(sent_by_ev, dict)
+                else (
+                    float(watch.get("last_notified_at") or 0)
+                    if str(watch.get("last_notified_event") or "") == "stalled"
+                    else 0.0
+                )
+            )
             last_stalled_ts = int(watch.get("last_stalled_updated_at_ms") or 0)
-            last_notified_at = float(watch.get("last_notified_at") or 0)
             already_alerted = (
-                last_ev == "stalled"
-                and last_stalled_ts == int(live_meta.updated_at_ms)
-                and (now - last_notified_at) < cooldown_s
+                last_stalled_ts == int(live_meta.updated_at_ms)
+                and last_stalled_notif > 0
+                and (now - last_stalled_notif) < cooldown_s
             )
             if not already_alerted:
                 event_type = "stalled"
@@ -338,16 +391,18 @@ def evaluate_watch(
     if event_type is None or event_type not in notify_on:
         return None, ""
 
+    # Cooldown is strictly isolated by event_type so high-priority waiting_approval /
+    # waiting_user / error alerts are never silenced by earlier completed / stalled notices.
     if cooldown_s > 0:
-        last_notified_at = float(watch.get("last_notified_at") or 0)
-        if last_notified_at > 0 and (now - last_notified_at) < cooldown_s:
-            return None, ""
-
         sent_by_event = watch.get("last_notified_by_event")
-        if isinstance(sent_by_event, dict):
+        last_same_at = 0.0
+        if isinstance(sent_by_event, dict) and sent_by_event.get(event_type):
             last_same_at = float(sent_by_event.get(event_type) or 0)
-            if last_same_at > 0 and (now - last_same_at) < cooldown_s:
-                return None, ""
+        elif str(watch.get("last_notified_event") or "") == event_type:
+            last_same_at = float(watch.get("last_notified_at") or 0)
+
+        if last_same_at > 0 and (now - last_same_at) < cooldown_s:
+            return None, ""
 
         sup_by_event = watch.get("last_suppressed_by_event")
         if isinstance(sup_by_event, dict):
@@ -367,6 +422,7 @@ def format_watch_notification(
     snippet: str = "",
     label_override: str = "",
     verdict: dict[str, Any] | None = None,
+    completion_summary: dict[str, Any] | None = None,
 ) -> str:
     """Format a compact Chinese notification ready for QQ/Weixin push."""
     label = (label_override or "").strip()
@@ -378,6 +434,16 @@ def format_watch_notification(
             label = str(bg["label"])
     if not label:
         label = _EVENT_LABELS.get(event_type, event_type)
+
+    if event_type == "completed" and completion_summary is not None:
+        return format_completion_card(
+            completion_summary,
+            watch=watch,
+            live_meta=live_meta,
+            label=label,
+            reason=reason,
+            verdict=verdict,
+        )
 
     prev_status = str(watch.get("last_status") or STATUS_IDLE)
     alias = str(watch.get("alias") or "").strip()
@@ -633,8 +699,8 @@ class WatchdogRunner:
         try:
             rd = adapter.read_session(
                 session_id,
-                tail_messages=3,
-                max_chars_per_message=1000,
+                tail_messages=10,
+                max_chars_per_message=2400,
                 include_tools=True,
             )
             msgs = [m for m in (rd.get("messages") or []) if isinstance(m, dict)]
@@ -651,6 +717,70 @@ class WatchdogRunner:
         snippet, _ = self._recent_context(adapter, session_id)
         return snippet
 
+    @staticmethod
+    def _build_fallback_targets(watch: dict[str, Any], primary_targets: list[str]) -> list[str]:
+        tried = set(primary_targets)
+        candidates: list[str] = []
+        raw_explicit = watch.get("fallback_targets")
+        if raw_explicit:
+            candidates.extend(parse_notify_targets(raw_explicit))
+        for tgt in primary_targets:
+            mapped = DEFAULT_FALLBACK_CHANNELS.get(tgt)
+            if mapped:
+                candidates.append(mapped)
+        deduped: list[str] = []
+        for fb in candidates:
+            if fb and fb not in tried and fb not in deduped:
+                deduped.append(fb)
+        return deduped
+
+    def _deliver_with_fallback(
+        self,
+        watch: dict[str, Any],
+        app: str,
+        sid: str,
+        event_type: str,
+        text: str,
+        targets: list[str],
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        deliveries: list[dict[str, Any]] = []
+        for tgt in targets:
+            try:
+                ok, info = self.notifier(tgt, text)
+            except Exception as exc:  # noqa: BLE001
+                ok, info = False, str(exc)
+            deliveries.append({"target": tgt, "ok": bool(ok), "detail": info, "fallback": False})
+            if not ok:
+                logger.warning("Watch delivery failed for %s:%s (%s) via %s: %s", app, sid, event_type, tgt, info)
+
+        any_delivered = any(d["ok"] for d in deliveries)
+        if not any_delivered:
+            for fb in self._build_fallback_targets(watch, targets):
+                logger.warning(
+                    "Attempting fallback delivery for %s:%s (%s) via '%s' after primary failure",
+                    app,
+                    sid,
+                    event_type,
+                    fb,
+                )
+                try:
+                    fb_ok, fb_info = self.notifier(fb, text)
+                except Exception as exc:  # noqa: BLE001
+                    fb_ok, fb_info = False, str(exc)
+                deliveries.append({"target": fb, "ok": bool(fb_ok), "detail": fb_info, "fallback": True})
+                if fb_ok:
+                    any_delivered = True
+                    break
+                logger.warning(
+                    "Fallback watch delivery failed for %s:%s (%s) via %s: %s",
+                    app,
+                    sid,
+                    event_type,
+                    fb,
+                    fb_info,
+                )
+        return any_delivered, deliveries
+
     def poll_once(self, *, dry_run: bool = False, now_ts: float | None = None) -> dict[str, Any]:
         """Run one poll cycle across all enabled watches."""
         now = time.time() if now_ts is None else float(now_ts)
@@ -658,7 +788,31 @@ class WatchdogRunner:
         checked = 0
         events: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
-        dirty = False
+        runtime_updates: dict[str, dict[str, Any]] = {}
+        clear_keys_by_id: dict[str, set[str]] = {}
+        fallback_unkeyed_dirty = False
+
+        def _stage_update(w_obj: dict[str, Any], key: str, value: Any) -> None:
+            nonlocal fallback_unkeyed_dirty
+            w_obj[key] = value
+            wid = str(w_obj.get("watch_id") or "")
+            if wid:
+                runtime_updates.setdefault(wid, {})[key] = value
+                clear_keys_by_id.get(wid, set()).discard(key)
+            else:
+                fallback_unkeyed_dirty = True
+
+        def _stage_clear(w_obj: dict[str, Any], key: str) -> None:
+            nonlocal fallback_unkeyed_dirty
+            had = key in w_obj
+            w_obj.pop(key, None)
+            wid = str(w_obj.get("watch_id") or "")
+            if wid:
+                clear_keys_by_id.setdefault(wid, set()).add(key)
+                if wid in runtime_updates:
+                    runtime_updates[wid].pop(key, None)
+            elif had:
+                fallback_unkeyed_dirty = True
 
         for w in watches:
             if not w.get("enabled", True):
@@ -689,8 +843,7 @@ class WatchdogRunner:
             )
             if event_type is None:
                 if w.get("pending_transition") and not dry_run:
-                    w.pop("pending_transition", None)
-                    dirty = True
+                    _stage_clear(w, "pending_transition")
             elif event_type in DEBOUNCE_EVENTS and eff_debounce > 0:
                 pending = w.get("pending_transition")
                 if (
@@ -701,26 +854,29 @@ class WatchdogRunner:
                     first_seen = float(pending.get("first_seen_at") or now)
                     if (now - first_seen) < eff_debounce:
                         if not dry_run:
-                            pending["count"] = int(pending.get("count") or 1) + 1
-                            dirty = True
+                            new_pending = dict(pending)
+                            new_pending["count"] = int(pending.get("count") or 1) + 1
+                            _stage_update(w, "pending_transition", new_pending)
                         continue
                     if not dry_run:
-                        w.pop("pending_transition", None)
-                        dirty = True
+                        _stage_clear(w, "pending_transition")
                 else:
                     if not dry_run:
-                        w["pending_transition"] = {
-                            "event": event_type,
-                            "status": meta.status,
-                            "first_seen_at": now,
-                            "count": 1,
-                        }
-                        dirty = True
+                        _stage_update(
+                            w,
+                            "pending_transition",
+                            {
+                                "event": event_type,
+                                "status": meta.status,
+                                "first_seen_at": now,
+                                "count": 1,
+                            },
+                        )
                     continue
             elif w.get("pending_transition") and not dry_run:
-                w.pop("pending_transition", None)
-                dirty = True
+                _stage_clear(w, "pending_transition")
 
+            delivery_blocked = False
             if event_type is not None:
                 snippet, context_messages = self._recent_context(adapter, sid)
                 combined_parts = [meta.preview or "", snippet] + [
@@ -770,6 +926,17 @@ class WatchdogRunner:
                         elif use_suppress and verdict.get("needs_attention") is False:
                             suppressed = True
 
+                completion_summary: dict[str, Any] | None = None
+                render_summary_card = False
+                if event_type == "completed":
+                    completion_summary = extract_task_completion_summary(
+                        session_meta=meta,
+                        messages=context_messages,
+                    )
+                    verdict_cls = str(verdict.get("classification") or "") if isinstance(verdict, dict) and verdict.get("ok") else ""
+                    if verdict_cls not in ("background_running", "still_running"):
+                        render_summary_card = True
+
                 text = format_watch_notification(
                     w,
                     event_type,
@@ -778,21 +945,47 @@ class WatchdogRunner:
                     snippet=snippet,
                     label_override=effective_label,
                     verdict=verdict,
+                    completion_summary=completion_summary if render_summary_card else None,
                 )
                 targets = parse_notify_targets(w.get("notify_targets"))
                 deliveries: list[dict[str, Any]] = []
+                any_delivered = False
+
                 if not dry_run:
                     if not suppressed:
-                        for tgt in targets:
-                            ok, info = self.notifier(tgt, text)
-                            deliveries.append({"target": tgt, "ok": ok, "detail": info})
-                        w["last_notified_event"] = event_type
-                        w["last_notified_at"] = now
-                        sent_map = w.get("last_notified_by_event")
-                        if not isinstance(sent_map, dict):
-                            sent_map = {}
-                        sent_map[event_type] = now
-                        w["last_notified_by_event"] = sent_map
+                        any_delivered, deliveries = self._deliver_with_fallback(
+                            w, app, sid, event_type, text, targets
+                        )
+                        if any_delivered:
+                            _stage_update(w, "last_notified_event", event_type)
+                            _stage_update(w, "last_notified_at", now)
+                            sent_map = dict(w.get("last_notified_by_event")) if isinstance(w.get("last_notified_by_event"), dict) else {}
+                            sent_map[event_type] = now
+                            _stage_update(w, "last_notified_by_event", sent_map)
+                            if event_type == "stalled":
+                                _stage_update(w, "last_stalled_updated_at_ms", meta.updated_at_ms)
+                            if "last_delivery_error" in w:
+                                _stage_clear(w, "last_delivery_error")
+                        else:
+                            # Hold transition open so the next cycle retries instead of dropping alerts.
+                            delivery_blocked = True
+                            logger.error(
+                                "All notification channels failed for %s:%s (%s); preserving last_status='%s' for retry: %s",
+                                app,
+                                sid,
+                                event_type,
+                                w.get("last_status"),
+                                deliveries,
+                            )
+                            _stage_update(
+                                w,
+                                "last_delivery_error",
+                                {
+                                    "at": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
+                                    "event": event_type,
+                                    "deliveries": deliveries,
+                                },
+                            )
                     else:
                         logger.info(
                             "Suppressed %s alert for %s:%s (%s)",
@@ -801,25 +994,27 @@ class WatchdogRunner:
                             sid,
                             verdict.get("summary", "") if isinstance(verdict, dict) else "",
                         )
-                        sup_map = w.get("last_suppressed_by_event")
-                        if not isinstance(sup_map, dict):
-                            sup_map = {}
+                        sup_map = dict(w.get("last_suppressed_by_event")) if isinstance(w.get("last_suppressed_by_event"), dict) else {}
                         sup_map[event_type] = now
-                        w["last_suppressed_by_event"] = sup_map
-                    if event_type == "stalled":
-                        w["last_stalled_updated_at_ms"] = meta.updated_at_ms
+                        _stage_update(w, "last_suppressed_by_event", sup_map)
+                        if event_type == "stalled":
+                            _stage_update(w, "last_stalled_updated_at_ms", meta.updated_at_ms)
+
                     if verdict is not None:
-                        w["last_verification"] = {
-                            "at": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
-                            "event": event_type,
-                            "ok": bool(verdict.get("ok")),
-                            "classification": verdict.get("classification", ""),
-                            "needs_attention": verdict.get("needs_attention"),
-                            "suppressed": suppressed,
-                            "summary": verdict.get("summary", ""),
-                            **({"error": verdict["error"]} if verdict.get("error") else {}),
-                        }
-                    dirty = True
+                        _stage_update(
+                            w,
+                            "last_verification",
+                            {
+                                "at": datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(timespec="seconds"),
+                                "event": event_type,
+                                "ok": bool(verdict.get("ok")),
+                                "classification": verdict.get("classification", ""),
+                                "needs_attention": verdict.get("needs_attention"),
+                                "suppressed": suppressed,
+                                "summary": verdict.get("summary", ""),
+                                **({"error": verdict["error"]} if verdict.get("error") else {}),
+                            },
+                        )
 
                 ev_entry: dict[str, Any] = {
                     "watch_id": w.get("watch_id"),
@@ -833,29 +1028,32 @@ class WatchdogRunner:
                     "targets": targets,
                     "dry_run": dry_run,
                     "suppressed": suppressed,
+                    "delivered": any_delivered if not dry_run and not suppressed else None,
                     "background_job": bg_info,
                     "message": text,
                     "deliveries": deliveries,
                 }
+                if completion_summary is not None:
+                    ev_entry["completion_summary"] = completion_summary
                 if verdict is not None:
                     ev_entry["verification"] = verdict
                 events.append(ev_entry)
 
-            if not dry_run:
-                if (
-                    w.get("last_status") != meta.status
-                    or w.get("last_status_detail") != meta.status_detail
-                    or w.get("last_updated_at_ms") != meta.updated_at_ms
-                    or w.get("title") != meta.title
-                ):
-                    w["last_status"] = meta.status
-                    w["last_status_detail"] = meta.status_detail
-                    w["last_updated_at_ms"] = meta.updated_at_ms
-                    w["title"] = meta.title
-                    dirty = True
+            if not dry_run and not delivery_blocked:
+                if w.get("last_status") != meta.status:
+                    _stage_update(w, "last_status", meta.status)
+                if w.get("last_status_detail") != meta.status_detail:
+                    _stage_update(w, "last_status_detail", meta.status_detail)
+                if w.get("last_updated_at_ms") != meta.updated_at_ms:
+                    _stage_update(w, "last_updated_at_ms", meta.updated_at_ms)
+                if w.get("title") != meta.title:
+                    _stage_update(w, "title", meta.title)
 
-        if dirty and not dry_run:
-            self.store.save_all(watches)
+        if not dry_run:
+            if fallback_unkeyed_dirty:
+                self.store.save_all(watches)
+            elif runtime_updates or clear_keys_by_id:
+                self.store.update_entries(runtime_updates, clear_keys_by_id=clear_keys_by_id)
 
         return {
             "checked_count": checked,

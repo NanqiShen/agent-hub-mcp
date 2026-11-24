@@ -33,6 +33,24 @@ function getActiveTaskId(controller) {
   return trimmed || null;
 }
 
+function getPendingAsk(controller) {
+  const msgs =
+    controller &&
+    controller.task &&
+    controller.task.messageStateHandler &&
+    Array.isArray(controller.task.messageStateHandler.messages)
+      ? controller.task.messageStateHandler.messages
+      : null;
+  if (!msgs || msgs.length === 0) return null;
+  const last = msgs[msgs.length - 1];
+  if (!last || last.type !== 'ask' || last.partial) return null;
+  return {
+    ask: typeof last.ask === 'string' ? last.ask : '',
+    text: String(last.text || '').slice(0, 300),
+    ts: last.ts ?? null,
+  };
+}
+
 function isClineController(obj) {
   return Boolean(
     obj &&
@@ -185,6 +203,10 @@ function stateFilePath() {
   return override || path.join(stateDirPath(), 'cline-bridge.json');
 }
 
+function portStateFilePath(port) {
+  return path.join(path.dirname(stateFilePath()), 'cline-bridges', `port-${port}.json`);
+}
+
 function loadOrCreateToken() {
   const filePath = tokenFilePath();
   const dirPath = path.dirname(filePath);
@@ -326,7 +348,7 @@ async function applyModelConfig(api, { model, provider, reasoningEffort }) {
   };
 }
 
-function writeStateFile(port) {
+function writeStateFile(port, { writePortRegistry = true } = {}) {
   const filePath = stateFilePath();
   const dirPath = path.dirname(filePath);
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
@@ -336,24 +358,42 @@ function writeStateFile(port) {
     workspaces: currentWorkspaces(),
     startedAt: new Date().toISOString(),
   };
-  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  const jsonStr = `${JSON.stringify(payload, null, 2)}\n`;
+  fs.writeFileSync(filePath, jsonStr, { encoding: 'utf8', mode: 0o600 });
   try {
     fs.chmodSync(filePath, 0o600);
   } catch {
     // Ignore.
   }
+
+  if (writePortRegistry) {
+    const portFile = portStateFilePath(port);
+    const bridgesDir = path.dirname(portFile);
+    fs.mkdirSync(bridgesDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(portFile, jsonStr, { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.chmodSync(portFile, 0o600);
+    } catch {
+      // Ignore.
+    }
+  }
 }
 
 function clearStateFileIfOwned() {
-  try {
-    const filePath = stateFilePath();
-    if (!fs.existsSync(filePath)) return;
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    if (data && data.pid === process.pid) {
-      fs.unlinkSync(filePath);
+  const candidates = [stateFilePath()];
+  if (boundPort) {
+    candidates.push(portStateFilePath(boundPort));
+  }
+  for (const filePath of candidates) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (data && data.pid === process.pid) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {
+      // Ignore cleanup errors.
     }
-  } catch {
-    // Ignore cleanup errors.
   }
 }
 
@@ -380,6 +420,98 @@ function listenOnPortRange(server, startPort, endPort) {
     };
     tryNext();
   });
+}
+
+function makeMismatchError(message, expectedSessionId, actualSessionId) {
+  const err = new Error(message);
+  err.status = 500;
+  err.errorCode = 'session_mismatch';
+  err.expectedSessionId = expectedSessionId || '';
+  err.actualSessionId = actualSessionId || '';
+  return err;
+}
+
+async function ensureTargetSession(
+  controller,
+  sessionId,
+  {
+    focusSidebar = false,
+    executeCommandImpl,
+    sidebarFocusDelayMs = 250,
+    postActivateSettleMs = 100,
+    waitForActiveTaskTimeoutMs = 3000,
+  }
+) {
+  const isExplicitSession = Boolean(
+    sessionId && sessionId !== 'active' && sessionId !== 'vscode-cline-active'
+  );
+  let activeTaskId = getActiveTaskId(controller);
+  let activatedSession = false;
+
+  if (isExplicitSession && activeTaskId !== sessionId) {
+    // Focus sidebar BEFORE loading task so VscodeWebviewProvider's initial clearTask() doesn't wipe it out.
+    try {
+      await executeCommandImpl('claude-dev.SidebarProvider.focus');
+    } catch {
+      // Non-fatal if sidebar view is already open or hidden.
+    }
+    if (sidebarFocusDelayMs > 0) {
+      await sleep(sidebarFocusDelayMs);
+    }
+
+    if (getActiveTaskId(controller) !== sessionId) {
+      if (typeof controller.showTaskWithId !== 'function') {
+        const err = new Error('Cline controller does not expose showTaskWithId');
+        err.status = 500;
+        throw err;
+      }
+      try {
+        await controller.showTaskWithId(sessionId);
+      } catch (showErr) {
+        const msg = showErr && showErr.message ? showErr.message : String(showErr);
+        throw makeMismatchError(msg, sessionId, getActiveTaskId(controller));
+      }
+      const ready = await waitForActiveTask(controller, sessionId, waitForActiveTaskTimeoutMs);
+      const loadedTaskId = getActiveTaskId(controller);
+      if (!ready || loadedTaskId !== sessionId) {
+        throw makeMismatchError(
+          `Failed to activate Cline session "${sessionId}" (activeTaskId=${loadedTaskId || 'none'})`,
+          sessionId,
+          loadedTaskId
+        );
+      }
+      if (postActivateSettleMs > 0) {
+        await sleep(postActivateSettleMs);
+      }
+      activatedSession = true;
+      activeTaskId = loadedTaskId;
+    }
+  } else if (isExplicitSession && activeTaskId === sessionId) {
+    if (focusSidebar) {
+      try {
+        await executeCommandImpl('claude-dev.SidebarProvider.focus');
+      } catch {
+        // Ignore.
+      }
+    }
+  } else {
+    if (focusSidebar) {
+      try {
+        await executeCommandImpl('claude-dev.SidebarProvider.focus');
+      } catch {
+        // Ignore.
+      }
+    }
+    if (!controller.task) {
+      const err = new Error(
+        'No active Cline task to send message to (t.task is null); pass sessionId to auto-activate a historical task'
+      );
+      err.status = 500;
+      throw err;
+    }
+  }
+
+  return { isExplicitSession, activeTaskId, activatedSession };
 }
 
 function createRequestHandler({
@@ -423,9 +555,16 @@ function createRequestHandler({
           clineActive: info.active,
           hasStartNewTask: typeof api.startNewTask === 'function',
           hasSendMessage: typeof api.sendMessage === 'function',
+          hasPressPrimaryButton: typeof api.pressPrimaryButton === 'function',
+          hasPressSecondaryButton: typeof api.pressSecondaryButton === 'function',
           hasController: Boolean(controller),
           hasShowTaskWithId: Boolean(controller && typeof controller.showTaskWithId === 'function'),
+          hasCancelTask: Boolean(
+            (controller && typeof controller.cancelTask === 'function') ||
+              typeof api.cancelTask === 'function'
+          ),
           activeTaskId: getActiveTaskId(controller),
+          pendingAsk: getPendingAsk(controller),
           workspaces: getWorkspacesImpl(),
         });
         return;
@@ -459,7 +598,10 @@ function createRequestHandler({
         let sessionId = null;
         try {
           const controller = await getClineController(info.api);
-          sessionId = getActiveTaskId(controller);
+          if (controller) {
+            await waitForActiveTask(controller, null, waitForActiveTaskTimeoutMs);
+            sessionId = getActiveTaskId(controller);
+          }
         } catch {
           sessionId = null;
         }
@@ -492,9 +634,6 @@ function createRequestHandler({
           return;
         }
 
-        const isExplicitSession = Boolean(
-          sessionId && sessionId !== 'active' && sessionId !== 'vscode-cline-active'
-        );
         const controller = await getClineController(info.api);
         if (!controller) {
           sendJson(res, 500, {
@@ -504,67 +643,13 @@ function createRequestHandler({
           return;
         }
 
-        let activeTaskId = getActiveTaskId(controller);
-        let activatedSession = false;
-
-        if (isExplicitSession && activeTaskId !== sessionId) {
-          // Focus sidebar BEFORE loading task so VscodeWebviewProvider's initial clearTask() doesn't wipe it out.
-          try {
-            await executeCommandImpl('claude-dev.SidebarProvider.focus');
-          } catch {
-            // Non-fatal if sidebar view is already open or hidden.
-          }
-          if (sidebarFocusDelayMs > 0) {
-            await sleep(sidebarFocusDelayMs);
-          }
-
-          if (getActiveTaskId(controller) !== sessionId) {
-            if (typeof controller.showTaskWithId !== 'function') {
-              sendJson(res, 500, {
-                ok: false,
-                error: 'Cline controller does not expose showTaskWithId',
-              });
-              return;
-            }
-            await controller.showTaskWithId(sessionId);
-            const ready = await waitForActiveTask(controller, sessionId, waitForActiveTaskTimeoutMs);
-            const loadedTaskId = getActiveTaskId(controller);
-            if (!ready || loadedTaskId !== sessionId) {
-              throw new Error(
-                `Failed to activate Cline session "${sessionId}" (activeTaskId=${loadedTaskId || 'none'})`
-              );
-            }
-            if (postActivateSettleMs > 0) {
-              await sleep(postActivateSettleMs);
-            }
-            activatedSession = true;
-            activeTaskId = loadedTaskId;
-          }
-        } else if (isExplicitSession && activeTaskId === sessionId) {
-          if (focusSidebar) {
-            try {
-              await executeCommandImpl('claude-dev.SidebarProvider.focus');
-            } catch {
-              // Ignore.
-            }
-          }
-        } else {
-          if (focusSidebar) {
-            try {
-              await executeCommandImpl('claude-dev.SidebarProvider.focus');
-            } catch {
-              // Ignore.
-            }
-          }
-          if (!controller.task) {
-            sendJson(res, 500, {
-              ok: false,
-              error:
-                'No active Cline task to send message to (t.task is null); pass sessionId to auto-activate a historical task',
-            });
-            return;
-          }
-        }
+        const { isExplicitSession, activatedSession } = await ensureTargetSession(controller, sessionId, {
+          focusSidebar,
+          executeCommandImpl,
+          sidebarFocusDelayMs,
+          postActivateSettleMs,
+          waitForActiveTaskTimeoutMs,
+        });
 
         const modelSelection = await applyModelConfig(info.api, { model, provider, reasoningEffort });
 
@@ -572,6 +657,13 @@ function createRequestHandler({
         if (!controller.task || (isExplicitSession && preSendId !== sessionId)) {
           sendJson(res, 500, {
             ok: false,
+            ...(isExplicitSession
+              ? {
+                  error_code: 'session_mismatch',
+                  expectedSessionId: sessionId,
+                  actualSessionId: preSendId || '',
+                }
+              : {}),
             error: isExplicitSession
               ? `Target Cline session "${sessionId}" is not active prior to sendMessage (activeTaskId=${preSendId || 'none'})`
               : 'No active Cline task prior to sendMessage (t.task is null)',
@@ -633,11 +725,136 @@ function createRequestHandler({
         return;
       }
 
+      if (req.method === 'POST' && pathname === '/approve') {
+        const body = await readJsonBody(req);
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        const rawDecision = typeof body.decision === 'string' ? body.decision.trim().toLowerCase() : 'yes';
+        const decision = ['yes', 'y', 'approve', 'allow'].includes(rawDecision)
+          ? 'yes'
+          : ['no', 'n', 'reject', 'deny'].includes(rawDecision)
+            ? 'no'
+            : '';
+        const feedback = typeof body.feedback === 'string' ? body.feedback.trim() : '';
+        const focusSidebar = body.focusSidebar === true;
+        if (!decision) {
+          sendJson(res, 400, { ok: false, error: 'decision must be yes or no' });
+          return;
+        }
+
+        const info = await getClineApiImpl({ activateIfNeeded: true });
+        if (!info.installed || !info.api) {
+          sendJson(res, 503, { ok: false, error: 'Cline extension is unavailable' });
+          return;
+        }
+        const controller = await getClineController(info.api);
+        if (!controller) {
+          sendJson(res, 500, { ok: false, error: 'Unable to access Cline internal controller for /approve' });
+          return;
+        }
+
+        const { isExplicitSession, activatedSession } = await ensureTargetSession(controller, sessionId, {
+          focusSidebar,
+          executeCommandImpl,
+          sidebarFocusDelayMs,
+          postActivateSettleMs,
+          waitForActiveTaskTimeoutMs,
+        });
+
+        const preId = getActiveTaskId(controller);
+        if (!controller.task || (isExplicitSession && preId !== sessionId)) {
+          throw makeMismatchError(
+            `Target Cline session "${sessionId}" is not active prior to approval`,
+            sessionId,
+            preId
+          );
+        }
+
+        const responseType = decision === 'yes' ? 'yesButtonClicked' : 'noButtonClicked';
+        if (feedback && typeof controller.task.handleWebviewAskResponse === 'function') {
+          await controller.task.handleWebviewAskResponse(responseType, feedback, []);
+        } else if (decision === 'yes' && typeof info.api.pressPrimaryButton === 'function') {
+          await info.api.pressPrimaryButton();
+        } else if (decision === 'no' && typeof info.api.pressSecondaryButton === 'function') {
+          await info.api.pressSecondaryButton();
+        } else if (typeof controller.task.handleWebviewAskResponse === 'function') {
+          await controller.task.handleWebviewAskResponse(responseType, feedback, []);
+        } else {
+          sendJson(res, 503, { ok: false, error: 'Cline approval button API is unavailable' });
+          return;
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          action: 'respondApproval',
+          decision,
+          sessionId: getActiveTaskId(controller) || (isExplicitSession ? sessionId : null),
+          activatedSession,
+          port: activePort,
+          workspaces: getWorkspacesImpl(),
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/cancel') {
+        const body = await readJsonBody(req);
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        const focusSidebar = body.focusSidebar === true;
+        const info = await getClineApiImpl({ activateIfNeeded: true });
+        if (!info.installed || !info.api) {
+          sendJson(res, 503, { ok: false, error: 'Cline extension is unavailable' });
+          return;
+        }
+        const controller = await getClineController(info.api);
+        if (!controller) {
+          sendJson(res, 500, { ok: false, error: 'Unable to access Cline internal controller for /cancel' });
+          return;
+        }
+
+        const { isExplicitSession, activatedSession } = await ensureTargetSession(controller, sessionId, {
+          focusSidebar,
+          executeCommandImpl,
+          sidebarFocusDelayMs,
+          postActivateSettleMs,
+          waitForActiveTaskTimeoutMs,
+        });
+
+        const preId = getActiveTaskId(controller);
+        if (isExplicitSession && preId !== sessionId) {
+          throw makeMismatchError(
+            `Target Cline session "${sessionId}" is not active prior to cancel`,
+            sessionId,
+            preId
+          );
+        }
+
+        if (typeof controller.cancelTask === 'function') {
+          await controller.cancelTask();
+        } else if (typeof info.api.cancelTask === 'function') {
+          await info.api.cancelTask();
+        } else {
+          sendJson(res, 501, { ok: false, error: 'Cline controller does not expose cancelTask' });
+          return;
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          action: 'cancelTask',
+          sessionId: getActiveTaskId(controller) || (isExplicitSession ? sessionId : null),
+          activatedSession,
+          port: activePort,
+          workspaces: getWorkspacesImpl(),
+        });
+        return;
+      }
+
       sendJson(res, 404, { ok: false, error: `Unknown route ${req.method} ${pathname}` });
     } catch (err) {
       const status = Number.isInteger(err && err.status) ? err.status : 500;
       sendJson(res, status, {
         ok: false,
+        ...(err && err.errorCode ? { error_code: err.errorCode } : {}),
+        ...(err && err.expectedSessionId ? { expectedSessionId: err.expectedSessionId } : {}),
+        ...(err && err.actualSessionId !== undefined ? { actualSessionId: err.actualSessionId } : {}),
         error: err && err.message ? err.message : String(err),
       });
     }
@@ -689,6 +906,7 @@ module.exports = {
     extractControllerViaInspector,
     getClineController,
     getActiveTaskId,
+    getPendingAsk,
     isClineController,
     waitForActiveTask,
     createRequestHandler,

@@ -101,3 +101,26 @@ class AuditLog:
         finally:
             os.close(fd)
         return enriched
+
+    def recent(
+        self,
+        *,
+        limit: int = 20,
+        app: str = "all",
+        action: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return newest-first audit log entries optionally filtered by target app or action."""
+        n = max(1, min(int(limit), 100))
+        app_filter = (app or "all").strip().lower()
+        act_filter = (action or "").strip().lower()
+        entries = self._read_tail_entries(max_lines=max(n * 8, 200))
+        out: list[dict[str, Any]] = []
+        for entry in reversed(entries):
+            if app_filter not in ("", "all", "*") and str(entry.get("target_app") or "").lower() != app_filter:
+                continue
+            if act_filter and str(entry.get("action") or "").lower() != act_filter:
+                continue
+            out.append(entry)
+            if len(out) >= n:
+                break
+        return out

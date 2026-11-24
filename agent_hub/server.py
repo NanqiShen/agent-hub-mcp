@@ -15,6 +15,7 @@ from .adapters import AntigravityAdapter, ClineAdapter, CodexAdapter, DshAdapter
 from .audit import AuditLog
 from .bindings import BindingStore
 from .models import ACTIVE_STATUSES, AppAdapter, VALID_APPS, format_local_iso
+from .summary import extract_task_completion_summary, format_handover_packet
 from .watcher import (
     WatchStore,
     WatchdogRunner,
@@ -192,18 +193,40 @@ class HubService:
         matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return matches[0][2], matches[0][3]
 
+    def _resolve_watch_alias(self, key: str, *, app_filter: str = "all") -> dict[str, Any] | None:
+        q = (key or "").strip()
+        if q.lower().startswith("alias:"):
+            q = q[6:].strip()
+        if not q:
+            return None
+        q_low = q.lower()
+        for w in self.watches.list_all():
+            w_alias = str(w.get("alias") or "").strip()
+            if not w_alias or w_alias.lower() != q_low:
+                continue
+            w_app = str(w.get("app") or "")
+            w_sid = str(w.get("session_id") or "")
+            if not w_app or not w_sid:
+                continue
+            if app_filter not in ("all", "alias", "") and app_filter != w_app and app_filter in self.adapters:
+                continue
+            return {"app": w_app, "session_id": w_sid, "alias": w_alias}
+        return None
+
     def _resolve_target(self, app: str, session_id: str) -> tuple[str | None, str | None, str | None]:
-        """Resolve app + session_id (supporting 'alias', exact IDs, and fuzzy phrase/content search)."""
+        """Resolve app + session_id (supporting 'alias', watch aliases, exact IDs, and fuzzy search)."""
         norm_app = normalize_app_name(app)
         sid = (session_id or "").strip()
 
         resolved = None
         if norm_app == "alias" or sid.lower().startswith("alias:"):
-            resolved = self.bindings.resolve(sid)
+            resolved = self.bindings.resolve(sid) or self._resolve_watch_alias(sid, app_filter=norm_app)
             if resolved is None:
                 return None, None, f"Task alias '{sid}' is not bound."
         elif sid:
             maybe = self.bindings.resolve(sid)
+            if maybe is None:
+                maybe = self._resolve_watch_alias(sid, app_filter=norm_app)
             if maybe is not None and (norm_app in ("all", str(maybe.get("app"))) or norm_app not in self.adapters):
                 resolved = maybe
 
@@ -483,6 +506,7 @@ class HubService:
         text: str,
         *,
         target_title: str,
+        workspace: str = "",
         mode: str,
         model: str = "",
         provider: str = "",
@@ -492,6 +516,8 @@ class HubService:
         kwargs: dict[str, Any] = {"mode": mode}
         if "target_title" in sig.parameters:
             kwargs["target_title"] = target_title
+        if workspace.strip() and "workspace" in sig.parameters:
+            kwargs["workspace"] = workspace.strip()
         if model.strip() and "model" in sig.parameters:
             kwargs["model"] = model.strip()
         if provider.strip() and "provider" in sig.parameters:
@@ -643,6 +669,7 @@ class HubService:
                 meta.session_id,
                 final_text,
                 target_title=meta.title,
+                workspace=meta.workspace,
                 mode=mode,
                 model=model_clean,
                 provider=provider_clean,
@@ -756,6 +783,10 @@ class HubService:
         extract_code_block: bool = False,
         override_text: str = "",
         prefix_instruction: str = "",
+        mode: str = "queue",
+        model: str = "",
+        provider: str = "",
+        reasoning_effort: str = "",
         dry_run: bool = True,
         allow_duplicate: bool = False,
         watch: bool = False,
@@ -845,7 +876,10 @@ class HubService:
             dst_sid,
             final_msg,
             sender_tag="",
-            mode="queue",
+            mode=mode or "queue",
+            model=model,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
             dry_run=dry_run,
             allow_duplicate=allow_duplicate,
             source_meta=source_meta,
@@ -873,6 +907,13 @@ class HubService:
         reasoning_effort: str = "",
         agent_preset: str = "",
         dry_run: bool = False,
+        watch: bool = False,
+        watch_alias: str = "",
+        notify_targets: str = "qqbot",
+        stall_minutes: int = 15,
+        notify_on: str = "all",
+        verify_agent: bool = False,
+        suppress_routine: bool = False,
     ) -> dict[str, Any]:
         """Create a new real desktop session (dsh, cline, codex, or antigravity) and optionally send the first message."""
         norm_app = normalize_app_name(app)
@@ -918,6 +959,7 @@ class HubService:
                 "has_initial_message": bool(final_text),
                 "writer_ready": bool(writer_st.get("ready")),
                 "writer_status": writer_st,
+                "watch_planned": bool(watch),
             }
 
         if not writer_st.get("ready"):
@@ -994,6 +1036,7 @@ class HubService:
                 session_id,
                 final_text,
                 target_title=title or session_id,
+                workspace=str(created.get("cwd", workspace) or ""),
                 mode="queue",
                 model=pass_model,
                 provider=pass_provider,
@@ -1021,7 +1064,307 @@ class HubService:
                 "char_count": len(final_text),
             }
 
+        if watch:
+            out["watch"] = self.watch_add(
+                norm_app,
+                session_id,
+                alias=watch_alias or title,
+                notify_targets=notify_targets,
+                stall_minutes=stall_minutes,
+                notify_on=notify_on,
+                verify_agent=verify_agent,
+                suppress_routine=suppress_routine,
+            )
+
         return out
+
+    def summarize_session(
+        self,
+        app: str,
+        session_id: str,
+        *,
+        tail_messages: int = 16,
+        max_chars_per_message: int = 4000,
+    ) -> dict[str, Any]:
+        """Extract a structured task completion summary card from a session."""
+        norm_app, sid, err = self._resolve_target(app, session_id)
+        if err or norm_app is None or sid is None:
+            return {"error": err or "Invalid session target"}
+        tail_messages = max(2, min(int(tail_messages), 50))
+        max_chars_per_message = max(400, min(int(max_chars_per_message), 16000))
+        summary = extract_task_completion_summary(
+            self.adapters[norm_app],
+            sid,
+            tail_messages=tail_messages,
+            max_chars_per_message=max_chars_per_message,
+        )
+        if "error" in summary:
+            return summary
+        return {"ok": True, **summary}
+
+    def handover_session(
+        self,
+        app: str,
+        session_id: str,
+        *,
+        target_hint: str = "",
+        tail_messages: int = 16,
+        max_chars_per_message: int = 4000,
+    ) -> dict[str, Any]:
+        """Build a lossless structured cross-agent handover packet for another agent."""
+        res = self.summarize_session(
+            app,
+            session_id,
+            tail_messages=tail_messages,
+            max_chars_per_message=max_chars_per_message,
+        )
+        if "error" in res:
+            return res
+        if target_hint.strip():
+            res["handover_prompt"] = format_handover_packet(res, target_hint=target_hint.strip())
+        return res
+
+    @staticmethod
+    def _normalize_approval_decision(decision: str) -> str | None:
+        raw = (decision or "").strip().lower()
+        if raw in ("yes", "y", "approve", "approved", "allow", "accept", "proceed", "confirm", "同意", "允许", "批准", "确认", "放行"):
+            return "yes"
+        if raw in ("no", "n", "reject", "rejected", "deny", "denied", "decline", "cancel", "拒绝", "不同意", "不允许", "驳回"):
+            return "no"
+        return None
+
+    def respond_approval(
+        self,
+        app: str,
+        session_id: str,
+        decision: str = "yes",
+        *,
+        feedback: str = "",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Approve or reject a pending tool/command confirmation in a real desktop session."""
+        norm_decision = self._normalize_approval_decision(decision)
+        if norm_decision is None:
+            return {"error": f"Invalid decision '{decision}'. Expected 'yes'/'approve' or 'no'/'reject'."}
+
+        norm_app, sid, err = self._resolve_target(app, session_id)
+        if err or norm_app is None or sid is None:
+            return {"error": err or "Invalid target session"}
+
+        writer = self.writers.get(norm_app)
+        if writer is None or not hasattr(writer, "respond_approval"):
+            return {"error": f"Remote approval is not supported for '{norm_app}' yet."}
+
+        meta = self.adapters[norm_app].get_session_meta(sid)
+        if meta is None:
+            if norm_app == "cline" and sid in ("active", "vscode-cline-active"):
+                from .models import STATUS_IDLE, SessionSummary
+
+                meta = SessionSummary(
+                    app="cline",
+                    session_id=sid,
+                    title="VS Code Cline (active task)",
+                    status=STATUS_IDLE,
+                )
+            else:
+                return {"error": f"Target session '{sid}' not found in '{norm_app}'."}
+
+        writer_st = writer.status()
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "app": norm_app,
+                "session_id": meta.session_id,
+                "title": meta.title,
+                "live_status": meta.status,
+                "live_status_detail": meta.status_detail,
+                "decision": norm_decision,
+                "feedback": feedback.strip(),
+                "writer_ready": bool(writer_st.get("ready")),
+                "writer_status": writer_st,
+            }
+
+        if not writer_st.get("ready"):
+            return {
+                "error": f"Write bridge for '{norm_app}' is not ready: {writer_st.get('detail', 'unavailable')}",
+                "writer_status": writer_st,
+            }
+
+        sig = inspect.signature(writer.respond_approval)
+        kwargs: dict[str, Any] = {}
+        if "target_title" in sig.parameters:
+            kwargs["target_title"] = meta.title
+        if "feedback" in sig.parameters:
+            kwargs["feedback"] = feedback.strip()
+        if "workspace" in sig.parameters and meta.workspace:
+            kwargs["workspace"] = meta.workspace
+
+        try:
+            res = writer.respond_approval(meta.session_id, norm_decision, **kwargs)
+        except SessionMismatchError as exc:
+            self.audit.record(
+                {
+                    "action": "respond_approval",
+                    "status": "error",
+                    "error_code": "session_mismatch",
+                    "dry_run": False,
+                    "target_app": norm_app,
+                    "target_session_id": meta.session_id,
+                    "target_title": meta.title,
+                    "decision": norm_decision,
+                    "expected_session_id": exc.expected_session_id,
+                    "actual_session_id": exc.actual_session_id,
+                    "error": str(exc),
+                }
+            )
+            return {
+                "error": str(exc),
+                "error_code": "session_mismatch",
+                "target_app": norm_app,
+                "target_session_id": meta.session_id,
+                "expected_session_id": exc.expected_session_id,
+                "actual_session_id": exc.actual_session_id,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.audit.record(
+                {
+                    "action": "respond_approval",
+                    "status": "error",
+                    "dry_run": False,
+                    "target_app": norm_app,
+                    "target_session_id": meta.session_id,
+                    "target_title": meta.title,
+                    "decision": norm_decision,
+                    "error": str(exc),
+                }
+            )
+            return {"error": str(exc), "target_app": norm_app, "target_session_id": meta.session_id}
+
+        verified_sid = str(res.get("verified_session_id") or res.get("sessionId") or meta.session_id).strip()
+        audit_entry = self.audit.record(
+            {
+                "action": "respond_approval",
+                "status": "approved" if norm_decision == "yes" else "rejected",
+                "dry_run": False,
+                "target_app": norm_app,
+                "target_session_id": verified_sid,
+                "target_title": str(res.get("verified_title") or meta.title),
+                "decision": norm_decision,
+                **({"feedback": feedback.strip()} if feedback.strip() else {}),
+            }
+        )
+        return {
+            "ok": True,
+            "audit_id": audit_entry["audit_id"],
+            "app": norm_app,
+            "session_id": verified_sid,
+            "verified_session_id": verified_sid,
+            "decision": norm_decision,
+            "bridge_result": res,
+        }
+
+    def cancel_session(self, app: str, session_id: str) -> dict[str, Any]:
+        """Cancel/interrupt an active running turn in a desktop session."""
+        norm_app, sid, err = self._resolve_target(app, session_id)
+        if err or norm_app is None or sid is None:
+            return {"error": err or "Invalid target session"}
+
+        writer = self.writers.get(norm_app)
+        if writer is None or not hasattr(writer, "cancel_session"):
+            return {"error": f"Remote session cancellation is not supported for '{norm_app}' yet."}
+
+        meta = self.adapters[norm_app].get_session_meta(sid)
+        if meta is None:
+            if norm_app == "cline" and sid in ("active", "vscode-cline-active"):
+                from .models import STATUS_IDLE, SessionSummary
+
+                meta = SessionSummary(
+                    app="cline",
+                    session_id=sid,
+                    title="VS Code Cline (active task)",
+                    status=STATUS_IDLE,
+                )
+            else:
+                return {"error": f"Target session '{sid}' not found in '{norm_app}'."}
+
+        writer_st = writer.status()
+        if not writer_st.get("ready"):
+            return {
+                "error": f"Write bridge for '{norm_app}' is not ready: {writer_st.get('detail', 'unavailable')}",
+                "writer_status": writer_st,
+            }
+
+        sig = inspect.signature(writer.cancel_session)
+        kwargs: dict[str, Any] = {}
+        if "target_title" in sig.parameters:
+            kwargs["target_title"] = meta.title
+        if "workspace" in sig.parameters and meta.workspace:
+            kwargs["workspace"] = meta.workspace
+
+        try:
+            res = writer.cancel_session(meta.session_id, **kwargs)
+        except SessionMismatchError as exc:
+            self.audit.record(
+                {
+                    "action": "cancel_session",
+                    "status": "error",
+                    "error_code": "session_mismatch",
+                    "target_app": norm_app,
+                    "target_session_id": meta.session_id,
+                    "expected_session_id": exc.expected_session_id,
+                    "actual_session_id": exc.actual_session_id,
+                    "error": str(exc),
+                }
+            )
+            return {
+                "error": str(exc),
+                "error_code": "session_mismatch",
+                "target_app": norm_app,
+                "target_session_id": meta.session_id,
+                "expected_session_id": exc.expected_session_id,
+                "actual_session_id": exc.actual_session_id,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.audit.record(
+                {
+                    "action": "cancel_session",
+                    "status": "error",
+                    "target_app": norm_app,
+                    "target_session_id": meta.session_id,
+                    "error": str(exc),
+                }
+            )
+            return {"error": str(exc), "target_app": norm_app, "target_session_id": meta.session_id}
+
+        verified_sid = str(res.get("verified_session_id") or res.get("sessionId") or meta.session_id).strip()
+        audit_entry = self.audit.record(
+            {
+                "action": "cancel_session",
+                "status": "cancelled",
+                "target_app": norm_app,
+                "target_session_id": verified_sid,
+                "target_title": meta.title,
+            }
+        )
+        return {
+            "ok": True,
+            "audit_id": audit_entry["audit_id"],
+            "app": norm_app,
+            "session_id": verified_sid,
+            "bridge_result": res,
+        }
+
+    def audit_recent(self, *, limit: int = 20, app: str = "all", action: str = "") -> dict[str, Any]:
+        """Inspect recent outbound send, relay, approval, cancel, and create audit records."""
+        norm_app = normalize_app_name(app)
+        entries = self.audit.recent(limit=limit, app=norm_app, action=action)
+        return {
+            "count": len(entries),
+            "app_filter": norm_app,
+            "action_filter": (action or "").strip(),
+            "entries": entries,
+        }
 
     def watch_add(
         self,
@@ -1367,6 +1710,10 @@ def hub_relay_message(
     extract_code_block: bool = False,
     override_text: str = "",
     prefix_instruction: str = "",
+    mode: str = "queue",
+    model: str = "",
+    provider: str = "",
+    reasoning_effort: str = "",
     dry_run: bool = True,
     allow_duplicate: bool = False,
     watch: bool = False,
@@ -1389,6 +1736,10 @@ def hub_relay_message(
         extract_code_block: If true, extract the main fenced code block (```...```) from the source message.
         override_text: Optional explicit text to relay instead of auto-picking from source transcript.
         prefix_instruction: Optional short instruction prepended before the relayed body.
+        mode: Target delivery mode ('queue' default, or 'steer' for active DSH turns).
+        model: Optional target model identifier.
+        provider: Optional target provider identifier.
+        reasoning_effort: Optional target reasoning effort ('low', 'medium', 'high', 'xhigh').
         dry_run: Defaults to True (safe preview); set False only once confirmed to actually dispatch.
         allow_duplicate: Bypass the 60-second duplicate-send guard if true.
         watch: If true, automatically register/refresh a watch on the verified target session after relay succeeds.
@@ -1410,6 +1761,10 @@ def hub_relay_message(
             extract_code_block=extract_code_block,
             override_text=override_text,
             prefix_instruction=prefix_instruction,
+            mode=mode,
+            model=model,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
             dry_run=dry_run,
             allow_duplicate=allow_duplicate,
             watch=watch,
@@ -1435,6 +1790,13 @@ def hub_create_session(
     reasoning_effort: str = "",
     agent_preset: str = "",
     dry_run: bool = False,
+    watch: bool = False,
+    watch_alias: str = "",
+    notify_targets: str = "qqbot",
+    stall_minutes: int = 15,
+    notify_on: str = "all",
+    verify_agent: bool = False,
+    suppress_routine: bool = False,
 ) -> str:
     """Create a new real desktop conversation ('dsh', 'cline', 'codex', or 'antigravity') and optionally send an initial message.
 
@@ -1449,6 +1811,13 @@ def hub_create_session(
         reasoning_effort: Optional reasoning effort / thinking depth ('low', 'medium', 'high', 'xhigh', etc.).
         agent_preset: Optional agent preset identifier (supported by 'dsh').
         dry_run: Preview without creating if true.
+        watch: If true, automatically register a zero-token watch on the newly created session.
+        watch_alias: Optional friendly alias for the auto-registered watch.
+        notify_targets: Comma-separated watch targets when watch=True (default 'qqbot').
+        stall_minutes: Watch stall threshold in minutes when watch=True (default 15).
+        notify_on: Watch event filter when watch=True (default 'all').
+        verify_agent: Enable Level-2 `hermes -z` verification when watch=True.
+        suppress_routine: Suppress routine alerts when watch=True and needs_attention=false.
     """
     return _dumps(
         _SERVICE.create_session(
@@ -1462,6 +1831,13 @@ def hub_create_session(
             reasoning_effort=reasoning_effort,
             agent_preset=agent_preset,
             dry_run=dry_run,
+            watch=watch,
+            watch_alias=watch_alias,
+            notify_targets=notify_targets,
+            stall_minutes=stall_minutes,
+            notify_on=notify_on,
+            verify_agent=verify_agent,
+            suppress_routine=suppress_routine,
         )
     )
 
@@ -1539,6 +1915,98 @@ def hub_watch_check_now(
             suppress_routine=suppress_routine,
         )
     )
+
+
+@mcp.tool()
+def hub_summarize_session(
+    app: str,
+    session_id: str,
+    tail_messages: int = 16,
+) -> str:
+    """Extract a structured completion summary card (objective, actions, verification/artifacts) for a session.
+
+    Args:
+        app: 'codex', 'dsh', 'antigravity', 'cline', 'alias', or 'all'.
+        session_id: Exact session ID, bound/watched task alias, or fuzzy phrase.
+        tail_messages: Number of recent messages to analyze (default 16).
+    """
+    return _dumps(_SERVICE.summarize_session(app=app, session_id=session_id, tail_messages=tail_messages))
+
+
+@mcp.tool()
+def hub_handover_session(
+    app: str,
+    session_id: str,
+    target_hint: str = "",
+    tail_messages: int = 16,
+) -> str:
+    """Build a structured lossless cross-agent handover packet from a session for relaying to another agent.
+
+    Args:
+        app: 'codex', 'dsh', 'antigravity', 'cline', 'alias', or 'all'.
+        session_id: Exact session ID, bound/watched task alias, or fuzzy phrase.
+        target_hint: Optional extra instruction appended to the handover packet.
+        tail_messages: Number of recent messages to analyze (default 16).
+    """
+    return _dumps(
+        _SERVICE.handover_session(
+            app=app,
+            session_id=session_id,
+            target_hint=target_hint,
+            tail_messages=tail_messages,
+        )
+    )
+
+
+@mcp.tool()
+def hub_respond_approval(
+    app: str,
+    session_id: str,
+    decision: str = "yes",
+    feedback: str = "",
+    dry_run: bool = False,
+) -> str:
+    """Approve or reject a pending tool/command confirmation prompt in a verified desktop session.
+
+    Args:
+        app: 'cline', 'codex', 'antigravity', 'dsh', 'alias', or 'all'.
+        session_id: Exact session ID, bound/watched alias, or fuzzy phrase.
+        decision: 'yes' / 'approve' / '同意' or 'no' / 'reject' / '拒绝'.
+        feedback: Optional explanation or follow-up comment (supported natively by Cline & DSH).
+        dry_run: Preview approval target without clicking if true.
+    """
+    return _dumps(
+        _SERVICE.respond_approval(
+            app=app,
+            session_id=session_id,
+            decision=decision,
+            feedback=feedback,
+            dry_run=dry_run,
+        )
+    )
+
+
+@mcp.tool()
+def hub_cancel_session(app: str, session_id: str) -> str:
+    """Cancel or stop an actively running turn in a desktop agent session.
+
+    Args:
+        app: 'dsh', 'cline', 'codex', 'antigravity', 'alias', or 'all'.
+        session_id: Exact session ID, bound/watched alias, or fuzzy phrase.
+    """
+    return _dumps(_SERVICE.cancel_session(app=app, session_id=session_id))
+
+
+@mcp.tool()
+def hub_audit_recent(limit: int = 20, app: str = "all", action: str = "") -> str:
+    """Inspect recent outbound send, relay, approval, cancel, and create_session audit entries.
+
+    Args:
+        limit: Maximum number of newest entries to return (1-100, default 20).
+        app: Filter by target app ('all', 'codex', 'dsh', 'antigravity', 'cline').
+        action: Optional filter ('send', 'relay', 'create_session', 'respond_approval', 'cancel_session').
+    """
+    return _dumps(_SERVICE.audit_recent(limit=limit, app=app, action=action))
 
 
 def main() -> None:

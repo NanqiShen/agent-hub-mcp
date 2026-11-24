@@ -13,6 +13,7 @@ from ..models import (
     STATUS_IDLE,
     STATUS_INTERRUPTED,
     STATUS_RUNNING,
+    STATUS_WAITING_APPROVAL,
     STATUS_WAITING_USER,
     SessionMessage,
     SessionSummary,
@@ -22,6 +23,10 @@ from ..models import (
     format_local_iso,
     parse_iso_or_epoch_ms,
     truncate_text,
+)
+
+_APPROVAL_ITEM_STATUSES = frozenset(
+    {"pending", "waiting_approval", "requires_approval", "awaiting_approval", "needsapproval", "needs_approval"}
 )
 
 
@@ -87,7 +92,10 @@ class CodexAdapter:
             ).fetchone()
             if turn_row:
                 t_status, err_json, _, _ = turn_row
-                if t_status == "inProgress":
+                if t_status in ("waitingApproval", "waiting_approval"):
+                    status = STATUS_WAITING_APPROVAL
+                    details.append("awaiting approval")
+                elif t_status == "inProgress":
                     status = STATUS_RUNNING
                     recent_items = con_hist.execute(
                         """
@@ -95,12 +103,45 @@ class CodexAdapter:
                         FROM thread_items
                         WHERE thread_id = ?
                         ORDER BY rollout_ordinal DESC
-                        LIMIT 6
+                        LIMIT 8
                         """,
                         (thread_id,),
                     ).fetchall()
                     for itype, ij in recent_items:
-                        if itype == "agentMessage":
+                        if itype in ("approvalRequest", "permissionRequest"):
+                            status = STATUS_WAITING_APPROVAL
+                            detail_txt = ""
+                            try:
+                                obj = json.loads(ij)
+                                detail_txt = clean_single_line(
+                                    obj.get("command") or obj.get("tool") or obj.get("reason") or "",
+                                    80,
+                                )
+                            except json.JSONDecodeError:
+                                pass
+                            details.append(f"awaiting approval: {detail_txt}".strip(": ") if detail_txt else "awaiting approval")
+                            break
+                        if itype == "userInputRequest":
+                            status = STATUS_WAITING_USER
+                            details.append("awaiting user input")
+                            break
+                        if itype in ("commandExecution", "fileChange", "mcpToolCall"):
+                            try:
+                                obj = json.loads(ij)
+                                item_st = str(obj.get("status") or "").strip().lower()
+                                ap_st = str(obj.get("approvalStatus") or obj.get("approval_status") or "").strip().lower()
+                                req_ap = obj.get("requiresApproval") is True
+                                if item_st in _APPROVAL_ITEM_STATUSES or ap_st in ("pending", "waiting", "awaiting") or req_ap:
+                                    status = STATUS_WAITING_APPROVAL
+                                    hint = clean_single_line(
+                                        obj.get("command") or obj.get("tool") or obj.get("name") or itype,
+                                        80,
+                                    )
+                                    details.append(f"awaiting approval ({itype}: {hint})")
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+                        elif itype == "agentMessage":
                             try:
                                 obj = json.loads(ij)
                                 questions = obj.get("questions")

@@ -351,6 +351,19 @@ export function apply(ctx) {
         const body = await readJsonBody(req);
         const defaultCwd = path.join(os.homedir(), 'Documents', 'deepseek-harness-default-workspace');
         const cwd = typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : defaultCwd;
+        if (
+          process.platform === 'darwin' &&
+          (/^\/(?:dshare|flash|gpfs|scratch)\b/i.test(cwd) || /^\/home\/[^/]+/i.test(cwd))
+        ) {
+          sendJson(res, 400, {
+            ok: false,
+            error: {
+              code: 'remote-path-not-local',
+              message: `Refusing to create local macOS DSH workspace at remote Linux path: ${cwd}`,
+            },
+          });
+          return;
+        }
         const title = typeof body.title === 'string' ? body.title.trim() : '';
         const rawPreset = typeof body.agentPreset === 'string' ? body.agentPreset.trim() : (typeof body.preset === 'string' ? body.preset.trim() : '');
         const agentPreset = rawPreset || undefined;
@@ -417,6 +430,61 @@ export function apply(ctx) {
         }
         const modelSelection = await applyModelSelection(sessionId, { provider, model, reasoningEffort });
         sendJson(res, 200, { ok: true, sessionId, modelSelection });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/approve') {
+        const body = await readJsonBody(req);
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        const rawDecision = typeof body.decision === 'string' ? body.decision.trim().toLowerCase() : 'yes';
+        const decision = ['yes', 'y', 'approve', 'allow'].includes(rawDecision)
+          ? 'yes'
+          : ['no', 'n', 'reject', 'deny'].includes(rawDecision)
+            ? 'no'
+            : '';
+        const feedback = typeof body.feedback === 'string' ? body.feedback.trim() : '';
+        if (!sessionId || !decision) {
+          sendJson(res, 400, {
+            ok: false,
+            error: { code: 'bad-request', message: 'sessionId and valid decision (yes/no) are required' },
+          });
+          return;
+        }
+
+        const agents = ctx.get?.('agents');
+        const agent = agents?.get?.(sessionId);
+        const approvedBool = decision === 'yes';
+
+        if (agent && typeof agent.respondApproval === 'function') {
+          const result = await agent.respondApproval({ approved: approvedBool, decision, feedback });
+          sendJson(res, 200, { ok: true, action: 'respondApproval', method: 'agent.respondApproval', sessionId, decision, result });
+          return;
+        }
+        if (agent && typeof agent.resolveApproval === 'function') {
+          const result = await agent.resolveApproval(approvedBool, feedback);
+          sendJson(res, 200, { ok: true, action: 'respondApproval', method: 'agent.resolveApproval', sessionId, decision, result });
+          return;
+        }
+
+        try {
+          const result = await invokeGateway('session', 'respondApproval', {
+            request: { sessionId, approved: approvedBool, decision, ...(feedback ? { feedback } : {}) },
+          });
+          sendJson(res, 200, { ok: true, action: 'respondApproval', method: 'gateway.session.respondApproval', sessionId, decision, result });
+          return;
+        } catch (gwErr) {
+          log?.warn?.('[dsh-agent-hub-bridge] session.respondApproval unavailable:', gwErr?.message ?? gwErr);
+        }
+
+        sendJson(res, 409, {
+          ok: false,
+          error: {
+            code: 'approval-hook-unavailable',
+            message:
+              'DSH Desktop plugin host did not expose an active in-process approval responder for this session; ' +
+              'please confirm in DSH Desktop UI or reply via queue prompt if it is a user question.',
+          },
+        });
         return;
       }
 

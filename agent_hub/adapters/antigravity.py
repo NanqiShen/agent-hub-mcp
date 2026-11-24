@@ -10,9 +10,12 @@ from urllib.parse import unquote, urlparse
 
 from ..models import (
     ACTIVE_STATUSES,
+    STATUS_ERROR,
     STATUS_IDLE,
     STATUS_INTERRUPTED,
     STATUS_RUNNING,
+    STATUS_WAITING_APPROVAL,
+    STATUS_WAITING_USER,
     SessionMessage,
     SessionSummary,
     clean_single_line,
@@ -55,20 +58,110 @@ class AntigravityAdapter:
         return ", ".join(cleaned)
 
     @staticmethod
+    def _has_parent_column(con: sqlite3.Connection) -> bool:
+        try:
+            cols = {row[1] for row in con.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+            return "parent_conversation_id" in cols
+        except sqlite3.Error:
+            return False
+
+    @staticmethod
     def _derive_status(raw_status: str | None, not_fully_idle: int | None, killed: int | None) -> tuple[str, str]:
-        if raw_status == "CASCADE_RUN_STATUS_RUNNING":
-            return STATUS_RUNNING, raw_status
-        if not_fully_idle:
-            return STATUS_RUNNING, "not_fully_idle"
+        st = (raw_status or "").strip().upper()
+        if "APPROVAL" in st:
+            return STATUS_WAITING_APPROVAL, str(raw_status or "awaiting_approval")
+        if "WAITING" in st:
+            return STATUS_WAITING_USER, str(raw_status or "waiting_user")
+        if "ERROR" in st or "FAIL" in st:
+            return STATUS_ERROR, str(raw_status or "error")
+        if st == "CASCADE_RUN_STATUS_RUNNING" or not_fully_idle:
+            return STATUS_RUNNING, str(raw_status or "not_fully_idle")
         if killed:
             return STATUS_INTERRUPTED, "killed"
         return STATUS_IDLE, ""
 
+    def _inspect_transcript_tail_status(self, session_id: str) -> tuple[str, str] | None:
+        tpath = self.brain_dir / session_id / ".system_generated" / "logs" / "transcript.jsonl"
+        if not tpath.exists():
+            return None
+        try:
+            size = tpath.stat().st_size
+            read_offset = max(0, size - 16384)
+            with tpath.open("rb") as fh:
+                if read_offset > 0:
+                    fh.seek(read_offset)
+                raw = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+        lines = raw.splitlines()
+        if read_offset > 0 and len(lines) > 1:
+            lines = lines[1:]
+
+        steps: list[dict[str, Any]] = []
+        for raw_ln in lines[-20:]:
+            s = raw_ln.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    steps.append(obj)
+            except json.JSONDecodeError:
+                continue
+
+        if not steps:
+            return None
+
+        for step in reversed(steps):
+            stype = str(step.get("type") or "").upper()
+            st = str(step.get("status") or "").upper()
+
+            if stype == "USER_INPUT":
+                return None
+
+            if st in ("WAITING_FOR_APPROVAL", "PENDING_APPROVAL", "AWAITING_APPROVAL", "WAITING_APPROVAL"):
+                return STATUS_WAITING_APPROVAL, clean_single_line(step.get("content") or step.get("status"), 120) or "awaiting approval"
+            if st in ("WAITING", "WAITING_FOR_USER", "AWAITING_USER", "WAITING_USER"):
+                return STATUS_WAITING_USER, clean_single_line(step.get("content") or step.get("status"), 120) or "awaiting user reply"
+
+            if stype == "ERROR_MESSAGE" or st == "ERROR":
+                return STATUS_ERROR, clean_single_line(step.get("content") or st, 140) or "step error"
+
+            if stype == "PLANNER_RESPONSE":
+                for tc in (step.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    tname = str(tc.get("name") or "")
+                    if tname == "ask_question":
+                        return STATUS_WAITING_USER, "awaiting ask_question reply"
+                    args = tc.get("arguments")
+                    if isinstance(args, dict):
+                        ameta = args.get("ArtifactMetadata")
+                        if isinstance(ameta, dict) and ameta.get("RequestFeedback") is True:
+                            return STATUS_WAITING_APPROVAL, "awaiting plan/artifact approval"
+                if st == "DONE":
+                    return None
+
+        return None
+
     def _row_to_summary(self, row: tuple[Any, ...]) -> SessionSummary:
-        cid, title, preview, step_count, last_mod, ws_uris, raw_status, not_idle, killed = row
+        cid, title, preview, step_count, last_mod, ws_uris, raw_status, not_idle, killed = row[:9]
+        parent_cid = str(row[9] or "").strip() if len(row) > 9 else ""
         status, detail = self._derive_status(raw_status, not_idle, killed)
+        tail_hit = self._inspect_transcript_tail_status(str(cid))
+        if tail_hit is not None:
+            t_status, t_detail = tail_hit
+            if t_status in (STATUS_WAITING_APPROVAL, STATUS_WAITING_USER):
+                if status in (STATUS_IDLE, STATUS_RUNNING):
+                    status, detail = t_status, t_detail
+            elif t_status == STATUS_ERROR and not killed:
+                if status in (STATUS_IDLE, STATUS_RUNNING):
+                    status, detail = t_status, t_detail
         ts_ms = parse_iso_or_epoch_ms(last_mod)
-        extra = {"step_count": int(step_count)} if step_count is not None else {}
+        extra: dict[str, Any] = {"step_count": int(step_count)} if step_count is not None else {}
+        if parent_cid:
+            extra["parent_conversation_id"] = parent_cid
         return SessionSummary(
             app=self.app_name,
             session_id=str(cid),
@@ -78,6 +171,7 @@ class AntigravityAdapter:
             workspace=self._parse_workspace(ws_uris),
             updated_at_ms=ts_ms,
             preview=clean_single_line(preview, 160),
+            is_subagent=bool(parent_cid),
             extra=extra,
         )
 
@@ -93,21 +187,27 @@ class AntigravityAdapter:
             return []
         con = connect_sqlite_ro(self.db_path)
         try:
-            where = "WHERE not_fully_idle = 1 OR status = 'CASCADE_RUN_STATUS_RUNNING'" if active_only else ""
+            has_parent = self._has_parent_column(con)
+            parent_expr = "parent_conversation_id" if has_parent else "'' AS parent_conversation_id"
+            clauses: list[str] = []
+            if not include_subagents and has_parent:
+                clauses.append("(parent_conversation_id IS NULL OR parent_conversation_id = '')")
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            fetch_n = max(limit * 3, 25) if active_only else limit
             rows = con.execute(
                 f"""
                 SELECT conversation_id, title, preview, step_count, last_modified_time,
-                       workspace_uris, status, not_fully_idle, killed
+                       workspace_uris, status, not_fully_idle, killed, {parent_expr}
                 FROM conversation_summaries
-                {where}
+                {where_sql}
                 ORDER BY last_modified_time DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (fetch_n,),
             ).fetchall()
             out = [self._row_to_summary(r) for r in rows]
             if active_only:
-                out = [s for s in out if s.status in ACTIVE_STATUSES]
+                out = [s for s in out if s.status in ACTIVE_STATUSES][:limit]
             return out
         finally:
             con.close()

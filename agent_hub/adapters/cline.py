@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 from typing import Any
+import urllib.request
 
 from ..models import (
     ACTIVE_STATUSES,
@@ -14,6 +15,7 @@ from ..models import (
     STATUS_IDLE,
     STATUS_INTERRUPTED,
     STATUS_RUNNING,
+    STATUS_WAITING_APPROVAL,
     STATUS_WAITING_USER,
     SessionMessage,
     SessionSummary,
@@ -29,6 +31,10 @@ from ..models import (
 
 _MSG_CACHE_LIMIT = 64
 _RECENT_ACTIVITY_GRACE_MS = 60_000
+_APPROVAL_ASKS = frozenset({"command", "tool", "use_mcp_server", "browser_action_launch", "command_output"})
+_USER_ASKS = frozenset(
+    {"followup", "plan_mode_respond", "mistake_limit_reached", "api_req_failed", "resume_task", "resume_completed_task"}
+)
 
 
 class ClineAdapter:
@@ -41,6 +47,7 @@ class ClineAdapter:
         cline_dir: Path | None = None,
         vscode_tasks_dir: Path | None = None,
     ) -> None:
+        self._use_default_paths = cline_dir is None and vscode_tasks_dir is None
         self.cline_dir = cline_dir or (Path.home() / ".cline")
         self.sessions_db = self.cline_dir / "data" / "db" / "sessions.db"
         self.search_db = self.cline_dir / "data" / "db" / "session-search.db"
@@ -59,6 +66,8 @@ class ClineAdapter:
     @staticmethod
     def _map_status(raw_status: str | None) -> tuple[str, str]:
         st = (raw_status or "").strip().lower()
+        if st in ("waiting_approval", "awaiting_approval", "approval_required", "needs_approval"):
+            return STATUS_WAITING_APPROVAL, st
         if st in ("running", "active", "in_progress", "started"):
             return STATUS_RUNNING, st
         if st in ("failed", "error", "errored"):
@@ -139,6 +148,103 @@ class ClineAdapter:
         if exit_int is not None:
             flags["exit_code"] = exit_int
         return STATUS_ERROR, err_detail, flags
+
+    @classmethod
+    def _classify_ask(cls, ask_name: str, text_hint: str = "") -> tuple[str, str]:
+        ask = (ask_name or "").strip().lower()
+        hint = clean_single_line(text_hint, 90)
+        suffix = f": {hint}" if hint else (f": {ask}" if ask else "")
+        if ask in _USER_ASKS:
+            return STATUS_WAITING_USER, f"awaiting user{suffix}"
+        return STATUS_WAITING_APPROVAL, f"awaiting approval{suffix}"
+
+    @classmethod
+    def _inspect_ui_or_messages_approval(cls, paths: dict[str, str]) -> tuple[str, str] | None:
+        ui_raw = paths.get("ui_messages_path")
+        if ui_raw:
+            ui_path = Path(ui_raw)
+            if ui_path.exists():
+                try:
+                    items = json.loads(ui_path.read_text(encoding="utf-8"))
+                    if isinstance(items, list) and items:
+                        last = items[-1]
+                        if isinstance(last, dict) and last.get("type") == "ask" and not last.get("partial"):
+                            return cls._classify_ask(str(last.get("ask") or ""), str(last.get("text") or ""))
+                except (OSError, json.JSONDecodeError):
+                    pass
+
+        msg_raw = paths.get("messages_path")
+        if msg_raw:
+            msg_path = Path(msg_raw)
+            if msg_path.exists():
+                try:
+                    data = json.loads(msg_path.read_text(encoding="utf-8"))
+                    raw_msgs = data.get("messages") if isinstance(data, dict) else data
+                    if isinstance(raw_msgs, list) and raw_msgs:
+                        last = raw_msgs[-1]
+                        if isinstance(last, dict):
+                            if last.get("type") == "ask" or last.get("approval_pending") is True or last.get("ask"):
+                                return cls._classify_ask(
+                                    str(last.get("ask") or "tool"),
+                                    extract_text_blocks(last.get("content")) or str(last.get("text") or ""),
+                                )
+                except (OSError, json.JSONDecodeError):
+                    pass
+        return None
+
+    def _probe_bridge_pending_asks(self) -> dict[str, tuple[str, str]]:
+        """Query local VS Code Cline bridge /health for live in-memory pending ask state."""
+        if not self._use_default_paths:
+            return {}
+        base_dir = Path.home() / ".hermes" / "agent-hub"
+        tok_path = base_dir / "cline-bridge.token"
+        if not tok_path.exists():
+            return {}
+        try:
+            token = tok_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return {}
+        if not token:
+            return {}
+
+        ports: list[int] = []
+        reg_dir = base_dir / "cline-bridges"
+        if reg_dir.exists():
+            for pfile in reg_dir.glob("*.json"):
+                try:
+                    p = int(json.loads(pfile.read_text(encoding="utf-8")).get("port") or 0)
+                    if p > 0 and p not in ports:
+                        ports.append(p)
+                except Exception:  # noqa: BLE001
+                    pass
+        state_file = base_dir / "cline-bridge.json"
+        if state_file.exists():
+            try:
+                p = int(json.loads(state_file.read_text(encoding="utf-8")).get("port") or 0)
+                if p > 0 and p not in ports:
+                    ports.append(p)
+            except Exception:  # noqa: BLE001
+                pass
+        if not ports:
+            ports.append(43918)
+
+        out: dict[str, tuple[str, str]] = {}
+        for port in ports[:4]:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=0.3) as resp:
+                    health = json.loads(resp.read().decode("utf-8"))
+                tid = str(health.get("activeTaskId") or "").strip()
+                pending = health.get("pendingAsk")
+                if tid and isinstance(pending, dict):
+                    out[tid] = self._classify_ask(str(pending.get("ask") or ""), str(pending.get("text") or ""))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
 
     @staticmethod
     def _parse_metadata_title(metadata_json: str | None) -> str:
@@ -251,7 +357,24 @@ class ClineAdapter:
                     paths = {
                         "messages_path": str(mp or ""),
                         "transcript_path": str(tp or ""),
+                        "ui_messages_path": str(self.vscode_tasks_dir / sid_str / "ui_messages.json"),
                     }
+                    if not status_flags.get("confirmed_terminal") and status != STATUS_INTERRUPTED:
+                        ask_hit = self._inspect_ui_or_messages_approval(paths)
+                        if ask_hit is not None:
+                            status, detail = ask_hit
+                            summary = SessionSummary(
+                                app=self.app_name,
+                                session_id=sid_str,
+                                title=title,
+                                status=status,
+                                status_detail=detail,
+                                workspace=str(ws_root or cwd or ""),
+                                updated_at_ms=ts_ms,
+                                preview=clean_single_line(prompt or title, 160),
+                                is_subagent=bool(is_subagent),
+                                extra=extra,
+                            )
                     by_id[sid_str] = (summary, paths)
             finally:
                 con.close()
@@ -266,6 +389,8 @@ class ClineAdapter:
                     continue
                 title = tdir.name
                 preview = ""
+                task_status = STATUS_IDLE
+                task_detail = ""
                 try:
                     ui_data = json.loads(ui_file.read_text(encoding="utf-8"))
                     if isinstance(ui_data, list):
@@ -274,18 +399,42 @@ class ClineAdapter:
                                 title = clean_single_line(item["text"], 120)
                                 preview = clean_single_line(item["text"], 160)
                                 break
+                        last = ui_data[-1] if ui_data else None
+                        if isinstance(last, dict) and last.get("type") == "ask" and not last.get("partial"):
+                            task_status, task_detail = self._classify_ask(
+                                str(last.get("ask") or ""),
+                                str(last.get("text") or ""),
+                            )
                 except (OSError, json.JSONDecodeError):
                     pass
                 summary = SessionSummary(
                     app=self.app_name,
                     session_id=tdir.name,
                     title=title,
-                    status=STATUS_IDLE,
+                    status=task_status,
+                    status_detail=task_detail,
                     updated_at_ms=int(ui_file.stat().st_mtime * 1000),
                     preview=preview,
                     extra={"source": "vscode_globalStorage"},
                 )
                 by_id[tdir.name] = (summary, {"ui_messages_path": str(ui_file)})
+
+        for live_sid, (live_st, live_detail) in self._probe_bridge_pending_asks().items():
+            if live_sid in by_id:
+                s, paths = by_id[live_sid]
+                s.status = live_st
+                s.status_detail = live_detail
+            else:
+                s = SessionSummary(
+                    app=self.app_name,
+                    session_id=live_sid,
+                    title=live_sid,
+                    status=live_st,
+                    status_detail=live_detail,
+                    updated_at_ms=int(time.time() * 1000),
+                    extra={"source": "vscode_cline_bridge"},
+                )
+                by_id[live_sid] = (s, {"ui_messages_path": str(self.vscode_tasks_dir / live_sid / "ui_messages.json")})
 
         return by_id
 
