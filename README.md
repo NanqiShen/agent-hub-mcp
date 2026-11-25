@@ -1,5 +1,7 @@
 # Agent Hub MCP (`agent-hub`)
 
+> 📖 中文项目总结（含架构图、工具清单、安全设计）：[`docs/PROJECT_SUMMARY.zh.md`](docs/PROJECT_SUMMARY.zh.md) ｜ 事故复盘：[`docs/INCIDENT_CROSS_TALK_AND_RELAY_ARCHITECTURE.md`](docs/INCIDENT_CROSS_TALK_AND_RELAY_ARCHITECTURE.md)
+
 Local MCP server, native bridges, and zero-token LaunchAgent watchdog that let **Hermes Agent** inspect sessions, manage task aliases, send messages into real desktop app conversations, relay prompts verbatim across agents, and push phone notifications on status transitions:
 
 - **Codex** (read via `~/.codex/state_5.sqlite`, `thread_history_1.sqlite`, `goals_1.sqlite`; opt-in CDP write/create/model-switch & live ChatGPT Desktop DOM read via `~/.hermes/scripts/launch-codex-cdp.sh`, protected by cross-process app mutex + React Fiber routing + Two-Phase session locking)
