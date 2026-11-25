@@ -8,12 +8,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +32,7 @@ from agent_hub.models import (
     SessionSummary,
     VALID_APPS,
 )
+from agent_hub.relay import RelayBroker, RelayStore, canonical_message_hash, is_relay_echo
 from agent_hub.server import HubService, _extract_last_code_block
 from agent_hub.watcher import (
     BG_LABEL_RUNNING,
@@ -789,7 +792,8 @@ class TestWatchdog(unittest.TestCase):
                 self.assertEqual(verdict["source"], "hermes-z")
                 called_cmd = mock_run.call_args[0][0]
                 self.assertEqual(called_cmd[:5], ["/usr/local/bin/hermes", "-m", "gemini-2.5-flash", "--reasoning", "low"])
-                self.assertEqual(called_cmd[5], "-z")
+                self.assertEqual(called_cmd[5:7], ["-t", "terminal"])
+                self.assertEqual(called_cmd[7], "-z")
 
     def test_global_cooldown_blocks_same_and_alternating_events(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1711,9 +1715,9 @@ async function reqJson(port, method, route, token, body) {
 
 
 class TestMcpStdioHandshake(unittest.TestCase):
-    """Verify real MCP stdio protocol handshake discovers all 20 tools."""
+    """Verify real MCP stdio protocol handshake discovers all 24 tools."""
 
-    def test_mcp_stdio_lists_all_20_tools_and_calls_overview_and_watch_list(self) -> None:
+    def test_mcp_stdio_lists_all_24_tools_and_calls_overview_and_watch_list(self) -> None:
         from mcp.client.session import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -1735,6 +1739,10 @@ class TestMcpStdioHandshake(unittest.TestCase):
             "hub_respond_approval",
             "hub_cancel_session",
             "hub_audit_recent",
+            "hub_relay_start",
+            "hub_relay_list",
+            "hub_relay_stop",
+            "hub_relay_tick",
             "hub_watch_add",
             "hub_watch_list",
             "hub_watch_remove",
@@ -1748,6 +1756,7 @@ class TestMcpStdioHandshake(unittest.TestCase):
                 env["AGENT_HUB_BINDINGS_PATH"] = str(Path(td) / "bindings.json")
                 env["AGENT_HUB_AUDIT_PATH"] = str(Path(td) / "audit.jsonl")
                 env["AGENT_HUB_WATCHES_PATH"] = str(Path(td) / "watches.json")
+                env["AGENT_HUB_RELAY_DB_PATH"] = str(Path(td) / "relay_states.sqlite")
                 params = StdioServerParameters(
                     command=sys.executable,
                     args=["-m", "agent_hub.server"],
@@ -1789,6 +1798,11 @@ class TestMcpStdioHandshake(unittest.TestCase):
                         self.assertFalse(ar_resp.is_error)
                         ar_parsed = json.loads(ar_resp.content[0].text)
                         self.assertEqual(ar_parsed["count"], 0)
+
+                        rl_resp = await session.call_tool("hub_relay_list", {})
+                        self.assertFalse(rl_resp.is_error)
+                        rl_parsed = json.loads(rl_resp.content[0].text)
+                        self.assertEqual(rl_parsed["count"], 0)
 
         asyncio.run(_probe())
 
@@ -3432,6 +3446,809 @@ async function reqJson(port, method, route, token, body) {
             aud_ap = svc.audit_recent(limit=10, app="antigravity", action="respond_approval")
             self.assertEqual(aud_ap["count"], 1)
             self.assertEqual(aud_ap["entries"][0]["status"], "approved")
+
+
+class TestCrossTalkProtectionAndMutex(unittest.TestCase):
+    """Verify incident anti-cross-talk Fiber routing, title gate, cross-process mutex, and live DOM reads."""
+
+    def test_incident_replay_class_b_vs_prja_fiber_nav_and_title_guard(self) -> None:
+        proja_sid = "aaaaaaaa-1111-4111-8111-111111111111"
+        challenge_sid = "bbbbbbbb-2222-4222-8222-222222222222"
+        calls: list[dict] = []
+        state: dict[str, Any] = {
+            "active_sid": challenge_sid,
+            "doc_title": "Branch · Class B",
+            "pathname": f"/g/g-p-zuoye/c/{challenge_sid}",
+            "consistent": True,
+            "conflict": "",
+            "mode": "stuck",  # 'stuck' | 'title_contradict' | 'conflict' | 'fiber_ok'
+            "poll_after_switch": 0,
+        }
+
+        class _IncidentWS:
+            def __init__(self, url: str, timeout: float = 15.0) -> None:  # noqa: ARG002
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):  # noqa: ANN002
+                return False
+
+            def send_text(self, raw: str) -> None:
+                calls.append(json.loads(raw))
+
+            def recv_text(self) -> str:
+                last = calls[-1]
+                cid = last["id"]
+                expr = (last.get("params") or {}).get("expression", "")
+                if "__agentHubReadSessionIdentity" in expr:
+                    if state["mode"] == "fiber_ok" and state.get("switched"):
+                        state["poll_after_switch"] += 1
+                        if state["poll_after_switch"] >= 1:
+                            state["active_sid"] = proja_sid
+                            state["doc_title"] = "Analytics Project A"
+                            state["pathname"] = f"/g/g-p-proja/c/{proja_sid}"
+                    val = {
+                        "sessionId": state["active_sid"],
+                        "title": state["doc_title"],
+                        "docTitle": state["doc_title"],
+                        "href": "app://-/index.html",
+                        "pathname": state["pathname"],
+                        "source": "router-fiber",
+                        "consistent": state["consistent"],
+                        "conflict": state["conflict"],
+                    }
+                    return json.dumps({"id": cid, "result": {"result": {"value": val}}})
+                if "findBySessionId" in expr:
+                    state["switched"] = True
+                    if state["mode"] == "title_contradict":
+                        # Simulate router ID changing while document.title lags on old session!
+                        state["active_sid"] = proja_sid
+                        state["doc_title"] = "Branch · Class B"
+                    elif state["mode"] == "conflict":
+                        state["active_sid"] = proja_sid
+                        state["doc_title"] = "Analytics Project A"
+                        state["consistent"] = False
+                        state["conflict"] = f"router={proja_sid} vs sidebar={challenge_sid}"
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {
+                                "result": {
+                                    "value": {
+                                        "ok": True,
+                                        "switched": True,
+                                        "switchMethod": "fiber-router-navigate",
+                                        "navigatedTo": f"/g/g-p-proja/c/{proja_sid}",
+                                    }
+                                }
+                            },
+                        }
+                    )
+                if "__agentHubVerifyPostSend" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {
+                                "result": {
+                                    "value": {
+                                        "composer_cleared": True,
+                                        "is_generating": True,
+                                        "message_appeared": True,
+                                    }
+                                }
+                            },
+                        }
+                    )
+                if "window.__hermes_active_composer" in expr and "sendBtn" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "method": "button"}}}})
+                if "window.__hermes_active_composer" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "isContentEditable": True}}}})
+                if "preComposer" in expr or "composer-not-found" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+                if "composer_found" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"composer_found": True, "has_unsaved_draft": False}}}})
+                return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch("agent_hub.writers.cdp_writer.SimpleWebSocket", _IncidentWS),
+            patch.object(
+                CdpWriter,
+                "_discover_endpoint",
+                return_value=(9222, [{"title": "Branch · Class B", "url": "app://-/index.html", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1"}]),
+            ),
+        ):
+            td_path = Path(td)
+            codex_w = CodexWriter()
+            codex_w._lock_dir = td_path
+            codex_w.switch_verify_timeout_s = 0.08
+            codex_w.switch_poll_interval_s = 0.02
+
+            # Case A: Stuck on Class B -> must abort with SessionMismatchError, zero injection
+            with self.assertRaises(SessionMismatchError) as ctx_a:
+                codex_w.send_message(proja_sid, "PRJ_A Stage 3 验收报告", target_title="Analytics Project A")
+            self.assertEqual(ctx_a.exception.actual_session_id, challenge_sid)
+            self.assertFalse(any(c["method"] == "Input.insertText" for c in calls))
+
+            # Case B1: Router ID updated but document.title still contradicts -> Fail Closed!
+            calls.clear()
+            state.update({"active_sid": challenge_sid, "doc_title": "Branch · Class B", "consistent": True, "conflict": "", "mode": "title_contradict", "switched": False})
+            with self.assertRaises(SessionMismatchError) as ctx_b1:
+                codex_w.send_message(proja_sid, "PRJ_A Stage 3 验收报告", target_title="Analytics Project A")
+            self.assertIn("contradiction", str(ctx_b1.exception))
+            self.assertFalse(any(c["method"] == "Input.insertText" for c in calls))
+
+            # Case B2: Router vs Sidebar conflict -> Fail Closed!
+            calls.clear()
+            state.update({"active_sid": challenge_sid, "doc_title": "Branch · Class B", "consistent": True, "conflict": "", "mode": "conflict", "switched": False})
+            with self.assertRaises(SessionMismatchError) as ctx_b2:
+                codex_w.send_message(proja_sid, "PRJ_A Stage 3 验收报告", target_title="Analytics Project A")
+            self.assertIn("inconsistent", str(ctx_b2.exception))
+            self.assertFalse(any(c["method"] == "Input.insertText" for c in calls))
+
+            # Case C: Smooth Fiber navigate from Class B -> PRJ_A + HubService cloud UUID support
+            calls.clear()
+            state.update({"active_sid": challenge_sid, "doc_title": "Branch · Class B", "consistent": True, "conflict": "", "mode": "fiber_ok", "switched": False, "poll_after_switch": 0})
+            codex_w.switch_verify_timeout_s = 0.5
+            svc = HubService(
+                adapters={
+                    "codex": _FakeAdapter("codex", SessionSummary(app="codex", session_id="other-local", title="Other", status=STATUS_IDLE)),
+                    "dsh": _FakeAdapter("dsh", SessionSummary(app="dsh", session_id="d1", title="D1", status=STATUS_IDLE)),
+                    "antigravity": _FakeAdapter("antigravity", SessionSummary(app="antigravity", session_id="a1", title="A1", status=STATUS_IDLE)),
+                    "cline": _FakeAdapter("cline", SessionSummary(app="cline", session_id="c1", title="C1", status=STATUS_IDLE)),
+                },
+                bindings=BindingStore(td_path / "bindings.json"),
+                audit=AuditLog(td_path / "audit.jsonl"),
+                watches=WatchStore(td_path / "watches.json"),
+                relays=RelayStore(td_path / "relay.sqlite"),
+                writers={
+                    "codex": codex_w,
+                    "dsh": _FakeWriter("dsh", ready=False),
+                    "antigravity": _FakeWriter("antigravity", ready=False),
+                    "cline": _FakeWriter("cline", ready=False),
+                },
+            )
+            res = svc.send_message("codex", proja_sid, "PRJ_A Stage 3 验收报告")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["verified_session_id"], proja_sid)
+            self.assertEqual(res["verified_title"], "Analytics Project A")
+            self.assertEqual(res["bridge_result"]["switch_method"], "fiber-router-navigate")
+            self.assertTrue(res["bridge_result"]["message_appeared"])
+            self.assertTrue(any(c["method"] == "Input.insertText" and "PRJ_A Stage 3" in c["params"]["text"] for c in calls))
+
+    def test_concurrent_app_mutex_serializes_threads_and_cross_process_flock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+
+            # 1. Thread-level serialization verification
+            spans: list[tuple[str, float, float]] = []
+
+            class _SlowWS:
+                def __init__(self, url: str, timeout: float = 15.0) -> None:  # noqa: ARG002
+                    self.reqs: list[dict] = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):  # noqa: ANN002
+                    return False
+
+                def send_text(self, raw: str) -> None:
+                    self.reqs.append(json.loads(raw))
+
+                def recv_text(self) -> str:
+                    last = self.reqs[-1]
+                    cid = last["id"]
+                    expr = (last.get("params") or {}).get("expression", "")
+                    if "__agentHubReadSessionIdentity" in expr:
+                        # Identify current session from which thread called? Just return a matching sentinel per test
+                        return json.dumps(
+                            {
+                                "id": cid,
+                                "result": {
+                                    "result": {
+                                        "value": {
+                                            "sessionId": active_holder["sid"],
+                                            "title": "Concurrent",
+                                            "docTitle": "Concurrent",
+                                            "href": "app://-/index.html",
+                                            "pathname": f"/c/{active_holder['sid']}",
+                                            "source": "router-fiber",
+                                            "consistent": True,
+                                        }
+                                    }
+                                },
+                            }
+                        )
+                    if "window.__hermes_active_composer" in expr and "sendBtn" in expr:
+                        return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "method": "button"}}}})
+                    if "window.__hermes_active_composer" in expr:
+                        return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "isContentEditable": True}}}})
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+
+            active_holder = {"sid": ""}
+            codex_w = CodexWriter()
+            codex_w._lock_dir = td_path
+            codex_w.lock_timeout_s = 5.0
+
+            def _wrapped_inject(self_w, ws, text):  # noqa: ANN001
+                t0 = time.monotonic()
+                time.sleep(0.10)
+                t1 = time.monotonic()
+                spans.append((text, t0, t1))
+                return {"ok": True, "method": "button"}
+
+            results: list[dict] = []
+            errors: list[Exception] = []
+
+            def _worker(sid: str, msg: str) -> None:
+                try:
+                    # Wait briefly after mutex entry is checked via _discover_endpoint hook
+                    res = codex_w.send_message(sid, msg)
+                    results.append(res)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            def _discover_for_thread():
+                # Only called while _acquire_app_mutex() is held!
+                active_holder["sid"] = "sess-1" if not spans else "sess-2"
+                return (9222, [{"title": "Concurrent", "url": "app://-/index.html", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1"}])
+
+            with (
+                patch("agent_hub.writers.cdp_writer.SimpleWebSocket", _SlowWS),
+                patch.object(CdpWriter, "_discover_endpoint", side_effect=_discover_for_thread),
+                patch.object(CdpWriter, "_cdp_inject_and_send", _wrapped_inject),
+            ):
+                t1 = threading.Thread(target=_worker, args=("sess-1", "msg-1"))
+                t2 = threading.Thread(target=_worker, args=("sess-2", "msg-2"))
+                t1.start()
+                time.sleep(0.02)
+                t2.start()
+                t1.join(timeout=5.0)
+                t2.join(timeout=5.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            spans.sort(key=lambda item: item[1])
+            self.assertLessEqual(spans[0][2], spans[1][1] + 0.001, f"Concurrent CDP sections overlapped: {spans}")
+
+            # 2. Cross-process fcntl.flock contention verification
+            lock_file = td_path / ".cdp-mutex-codex.lock"
+            child_code = (
+                "import fcntl, os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                "sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
+                "time.sleep(0.35)\n"
+                "fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)\n"
+            )
+            proc = subprocess.Popen([sys.executable, "-c", child_code, str(lock_file)], stdout=subprocess.PIPE, text=True)
+            try:
+                assert proc.stdout is not None
+                line = proc.stdout.readline().strip()
+                self.assertEqual(line, "LOCKED")
+
+                fast_w = CodexWriter()
+                fast_w._lock_dir = td_path
+                fast_w.lock_timeout_s = 0.12
+                with self.assertRaises(TimeoutError):
+                    with fast_w._acquire_app_mutex():
+                        pass
+
+                patient_w = CodexWriter()
+                patient_w._lock_dir = td_path
+                patient_w.lock_timeout_s = 2.0
+                with patient_w._acquire_app_mutex():
+                    entered = True
+                self.assertTrue(entered)
+            finally:
+                proc.wait(timeout=5.0)
+
+    def test_cdp_read_live_session_verifies_identity_and_extracts_messages(self) -> None:
+        calls: list[dict] = []
+        state = {"sid": "aaaaaaaa-1111-4111-8111-111111111111", "title": "Analytics Project A"}
+
+        class _LiveReadWS:
+            def __init__(self, url: str, timeout: float = 15.0) -> None:  # noqa: ARG002
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):  # noqa: ANN002
+                return False
+
+            def send_text(self, raw: str) -> None:
+                calls.append(json.loads(raw))
+
+            def recv_text(self) -> str:
+                last = calls[-1]
+                cid = last["id"]
+                expr = (last.get("params") or {}).get("expression", "")
+                if "__agentHubReadSessionIdentity" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {
+                                "result": {
+                                    "value": {
+                                        "sessionId": state["sid"],
+                                        "title": state["title"],
+                                        "docTitle": state["title"],
+                                        "href": "app://-/index.html",
+                                        "pathname": f"/c/{state['sid']}",
+                                        "source": "router-fiber",
+                                        "consistent": True,
+                                    }
+                                }
+                            },
+                        }
+                    )
+                if "findBySessionId" in expr:
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "switched": False, "switchMethod": "not-found"}}}})
+                if "__agentHubReadLiveMessages" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {
+                                "result": {
+                                    "value": {
+                                        "is_generating": False,
+                                        "messages": [
+                                            {"index": 1, "role": "user", "content": "请审核 P0"},
+                                            {"index": 2, "role": "assistant", "content": "终审裁决：P0 已关闭"},
+                                        ],
+                                    }
+                                }
+                            },
+                        }
+                    )
+                return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch("agent_hub.writers.cdp_writer.SimpleWebSocket", _LiveReadWS),
+            patch.object(
+                CdpWriter,
+                "_discover_endpoint",
+                return_value=(9222, [{"title": "Analytics Project A", "url": "app://-/index.html", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1"}]),
+            ),
+        ):
+            cw = CodexWriter()
+            cw._lock_dir = Path(td)
+            cw.switch_verify_timeout_s = 0.05
+            live = cw.read_live_session("aaaaaaaa-1111-4111-8111-111111111111", target_title="Analytics Project A")
+            self.assertEqual(live["verified_session_id"], "aaaaaaaa-1111-4111-8111-111111111111")
+            self.assertEqual(len(live["messages"]), 2)
+            self.assertEqual(live["messages"][-1]["content"], "终审裁决：P0 已关闭")
+
+            with self.assertRaises(SessionMismatchError):
+                cw.read_live_session("bbbbbbbb-2222-4222-8222-222222222222", target_title="Branch · Class B")
+
+    def test_cdp_read_live_session_uses_fiber_and_restores_previous_session(self) -> None:
+        prev_sid = "dddddddd-4444-4444-8444-444444444444"
+        target_sid = "aaaaaaaa-1111-4111-8111-111111111111"
+        calls: list[dict] = []
+        state: dict[str, Any] = {"active": prev_sid, "switches": []}
+
+        class _FiberReadWS:
+            def __init__(self, url: str, timeout: float = 15.0) -> None:  # noqa: ARG002
+                self.url = url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):  # noqa: ANN002
+                return False
+
+            def send_text(self, raw: str) -> None:
+                calls.append(json.loads(raw))
+
+            def recv_text(self) -> str:
+                last = calls[-1]
+                cid = last["id"]
+                expr = (last.get("params") or {}).get("expression", "")
+                if "__agentHubReadSessionIdentity" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {"result": {"value": {
+                                "sessionId": state["active"],
+                                "title": "Analytics Project B" if state["active"] == prev_sid else "Analytics Project A",
+                                "docTitle": "Analytics Project B" if state["active"] == prev_sid else "Analytics Project A",
+                                "href": "app://-/index.html",
+                                "pathname": f"/c/{state['active']}",
+                                "source": "router-fiber",
+                                "consistent": True,
+                            }}},
+                        }
+                    )
+                if "findBySessionId" in expr:
+                    m = re.search(r'"sessionId":\s*"([^"]+)"', expr)
+                    sid = m.group(1) if m else ""
+                    state["switches"].append(sid)
+                    state["active"] = sid
+                    return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True, "switched": True, "switchMethod": "fiber-router-navigate"}}}})
+                if "__agentHubReadLiveMessages" in expr:
+                    return json.dumps(
+                        {
+                            "id": cid,
+                            "result": {"result": {"value": {
+                                "source": "fiber",
+                                "is_generating": False,
+                                "messages": [
+                                    {"index": 1, "role": "user", "content": "请审核 P0"},
+                                    {
+                                        "index": 2,
+                                        "role": "assistant",
+                                        "content": "完整正文 answered fully \ue200genui\ue202{\"widget\":1}\ue201 end",
+                                    },
+                                ],
+                            }}},
+                        }
+                    )
+                return json.dumps({"id": cid, "result": {"result": {"value": {"ok": True}}}})
+
+        with (
+            tempfile.TemporaryDirectory() as td,
+            patch("agent_hub.writers.cdp_writer.SimpleWebSocket", _FiberReadWS),
+            patch.object(
+                CdpWriter,
+                "_discover_endpoint",
+                return_value=(9222, [{"title": "Analytics Project B", "url": "app://-/index.html", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/p1"}]),
+            ),
+        ):
+            cw = CodexWriter()
+            cw._lock_dir = Path(td)
+            cw.switch_verify_timeout_s = 0.3
+            cw.switch_poll_interval_s = 0.01
+            live = cw.read_live_session(target_sid, target_title="Analytics Project A", tail_messages=5)
+
+        self.assertEqual(live["verified_session_id"], target_sid)
+        self.assertEqual(live["session"]["extra"]["extraction"], "fiber")
+        self.assertEqual(len(live["messages"]), 2)
+        body = live["messages"][1]["content"]
+        self.assertIn("answered fully", body)
+        self.assertIn("end", body)
+        self.assertNotIn("\ue200", body)
+        self.assertNotIn("genui", body)
+        # Switched to the target first, then restored the previously active session.
+        self.assertEqual(state["switches"], [target_sid, prev_sid])
+        self.assertEqual(state["active"], prev_sid)
+
+    def test_default_hermes_verify_cmd_uses_provider_toolsets_and_timeout(self) -> None:
+        from agent_hub.watcher import default_hermes_verify
+
+        captured: dict[str, Any] = {}
+
+        class _P:
+            returncode = 0
+            stdout = '{"classification":"completed","needs_attention":false,"label":"回合完毕","summary":"done"}'
+            stderr = ""
+
+        def _fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = dict(kwargs)
+            return _P()
+
+        with patch("agent_hub.watcher.subprocess.run", side_effect=_fake_run):
+            verdict = default_hermes_verify(
+                {"watch": {"app": "cline", "session_id": "s1"}, "event_type": "error"},
+                model="deepseek-v4.1-flash",
+                provider="custom:qqbot-deepseek",
+                toolsets="terminal",
+                timeout=90,
+            )
+
+        self.assertTrue(verdict["ok"])
+        cmd = captured["cmd"]
+        self.assertIn("-m", cmd)
+        self.assertIn("deepseek-v4.1-flash", cmd)
+        self.assertIn("--provider", cmd)
+        self.assertIn("custom:qqbot-deepseek", cmd)
+        self.assertIn("-t", cmd)
+        self.assertIn("terminal", cmd)
+        self.assertIn("-z", cmd)
+        self.assertEqual(captured["kwargs"].get("timeout"), 90)
+
+    def test_cline_stale_terminal_exit_after_completed_round_is_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cl_dir = Path(td) / "cline"
+            (cl_dir / "data" / "db").mkdir(parents=True)
+            (cl_dir / "data" / "sessions").mkdir(parents=True)
+            vsc_dir = Path(td) / "vsc_tasks"
+            vsc_dir.mkdir(parents=True)
+
+            msg_done = cl_dir / "data" / "sessions" / "s-done.json"
+            msg_done.write_text(
+                json.dumps({"messages": [
+                    {"role": "user", "content": "do work"},
+                    {"role": "assistant", "content": "全部交付完成\n\n# 执行完毕"},
+                ]}),
+                encoding="utf-8",
+            )
+            msg_ask = cl_dir / "data" / "sessions" / "s-ask.json"
+            msg_ask.write_text(
+                json.dumps({"messages": [
+                    {"role": "assistant", "content": "working"},
+                    {"role": "assistant", "type": "ask", "ask": "api_req_failed", "text": "API error"},
+                ]}),
+                encoding="utf-8",
+            )
+
+            con = sqlite3.connect(cl_dir / "data" / "db" / "sessions.db")
+            con.execute(
+                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, source TEXT, pid INTEGER, started_at TEXT, ended_at TEXT, exit_code INTEGER, status TEXT, status_message TEXT, cwd TEXT, workspace_root TEXT, prompt TEXT, metadata_json TEXT, messages_path TEXT, transcript_path TEXT, updated_at TEXT, is_subagent INTEGER, model TEXT, provider TEXT)"
+            )
+            con.executemany(
+                "INSERT INTO sessions VALUES (?, 'vscode', 1, '2026-11-25T10:00:00Z', '2030-01-01T00:00:00Z', 1, 'failed', '', '/tmp', '/tmp', 'p', '{}', ?, '', '2026-11-25T11:38:00Z', 0, 'm', 'p')",
+                [("s-done", str(msg_done)), ("s-ask", str(msg_ask))],
+            )
+            con.commit()
+            con.close()
+
+            ad = ClineAdapter(cline_dir=cl_dir, vscode_tasks_dir=vsc_dir)
+            done_meta = ad.get_session_meta("s-done")
+            self.assertIsNotNone(done_meta)
+            self.assertEqual(done_meta.status, STATUS_IDLE)
+            self.assertIn("回合已结束", done_meta.status_detail)
+            self.assertTrue(done_meta.extra.get("stale_terminated"))
+
+            ask_meta = ad.get_session_meta("s-ask")
+            self.assertIsNotNone(ask_meta)
+            self.assertEqual(ask_meta.status, STATUS_ERROR)
+
+
+class TestNativeRelayBroker(unittest.TestCase):
+    """Verify SQLite RelayStore, idempotent transactions, debounce, echo suppression, and closed-loop broker."""
+
+    def test_relay_store_crud_idempotent_tx_and_notification_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "relay_states.sqlite"
+            store = RelayStore(db_path)
+
+            link = store.upsert_link(
+                name="prja-loop",
+                source_app="cline",
+                source_session_id="cline-prja-1",
+                source_title="Cline PRJ_A",
+                target_app="codex",
+                target_session_id="aaaaaaaa-1111-4111-8111-111111111111",
+                target_title="Analytics Project A",
+                bidirectional=True,
+                policy={"settle_seconds": 20, "max_hops": 10},
+                state={"last_relayed_hash_a": "abc", "hop_count": 0},
+            )
+            self.assertTrue(link["relay_id"].startswith("r_"))
+            self.assertEqual(len(store.list_links()), 1)
+
+            chash = canonical_message_hash("[via Hermes]\n\nStage 3 PASS  \r\n")
+            self.assertEqual(chash, canonical_message_hash("Stage 3 PASS"))
+            self.assertTrue(is_relay_echo("[Agent Hub Relay | prja-loop | cline -> codex]\n\nhello"))
+            self.assertTrue(is_relay_echo("[via Hermes | relayed from codex:x]\n\nhello"))
+            self.assertFalse(is_relay_echo("普通输出内容"))
+
+            self.assertFalse(store.has_sent_tx(link["relay_id"], "a_to_b", chash))
+            store.record_tx(
+                {
+                    "relay_id": link["relay_id"],
+                    "direction": "a_to_b",
+                    "source_app": "cline",
+                    "source_session_id": "cline-prja-1",
+                    "target_app": "codex",
+                    "target_session_id": "aaaaaaaa-1111-4111-8111-111111111111",
+                    "source_msg_index": 3,
+                    "content_hash": chash,
+                    "status": "sent",
+                    "audit_id": "aud-1",
+                    "verified_session_id": "aaaaaaaa-1111-4111-8111-111111111111",
+                }
+            )
+            self.assertTrue(store.has_sent_tx(link["relay_id"], "a_to_b", chash))
+            self.assertEqual(len(store.recent_transactions(relay_id=link["relay_id"])), 1)
+
+            nkey = store.notif_key_for(link["relay_id"], "milestone", chash[:12])
+            self.assertFalse(store.has_notified(nkey))
+            store.record_notification(nkey, link["relay_id"], "milestone", ["weixin"], True, "ok")
+            self.assertTrue(store.has_notified(nkey))
+
+            paused = store.set_enabled("prja-loop", False)
+            self.assertFalse(paused["enabled"])
+            self.assertEqual(len(store.list_links(include_disabled=False)), 0)
+            self.assertEqual(len(store.list_links(include_disabled=True)), 1)
+
+            deleted = store.delete_link("prja-loop")
+            self.assertIsNotNone(deleted)
+            self.assertEqual(len(store.list_links(include_disabled=True)), 0)
+
+    def test_bidirectional_relay_broker_closed_loop_debounce_and_milestone_alerts(self) -> None:
+        class _ScriptedEndpointAdapter:
+            def __init__(self, app_name: str, sid: str, title: str, initial_text: str) -> None:
+                self.app_name = app_name
+                self.summary = SessionSummary(app=app_name, session_id=sid, title=title, status=STATUS_IDLE, updated_at_ms=1000)
+                self.messages: list[dict[str, Any]] = [{"index": 1, "role": "assistant", "content": initial_text}]
+
+            def list_sessions(self, **kwargs):  # noqa: ANN003
+                return [self.summary]
+
+            def search_sessions(self, query: str, **kwargs):  # noqa: ANN003
+                return []
+
+            def get_session_meta(self, session_id: str) -> SessionSummary | None:
+                return self.summary if session_id == self.summary.session_id else None
+
+            def read_session(self, session_id: str, **kwargs):  # noqa: ANN003
+                return {
+                    "session": self.summary.to_dict(),
+                    "message_count_returned": len(self.messages),
+                    "messages": list(self.messages),
+                }
+
+        class _ScriptedWriter:
+            def __init__(self, app_name: str, *, mismatch_on_send: bool = False) -> None:
+                self.app_name = app_name
+                self.mismatch_on_send = mismatch_on_send
+                self.sent: list[dict[str, Any]] = []
+
+            def status(self) -> dict[str, Any]:
+                return {"app": self.app_name, "ready": True, "transport": "scripted"}
+
+            def send_message(self, session_id: str, text: str, *, target_title: str = "", mode: str = "queue") -> dict[str, Any]:
+                if self.mismatch_on_send:
+                    raise SessionMismatchError(
+                        app_name=self.app_name,
+                        expected_session_id=session_id,
+                        expected_title=target_title,
+                        actual_session_id="bbbbbbbb-2222-4222-8222-222222222222",
+                        actual_title="Branch · Class B",
+                        reason="mock mismatch",
+                    )
+                self.sent.append({"session_id": session_id, "text": text, "mode": mode})
+                return {
+                    "ok": True,
+                    "sessionId": session_id,
+                    "verified_session_id": session_id,
+                    "verified_title": target_title,
+                    "mode": mode,
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cline_ep = _ScriptedEndpointAdapter("cline", "cline-prja-1", "Cline PRJ_A", "旧历史消息不应被重放")
+            codex_ep = _ScriptedEndpointAdapter("codex", "aaaaaaaa-1111-4111-8111-111111111111", "Analytics Project A", "旧审阅记录")
+            cline_w = _ScriptedWriter("cline")
+            codex_w = _ScriptedWriter("codex")
+            pushes: list[tuple[str, str]] = []
+
+            svc = HubService(
+                adapters={
+                    "cline": cline_ep,
+                    "codex": codex_ep,
+                    "dsh": _FakeAdapter("dsh", SessionSummary(app="dsh", session_id="d1", title="D1", status=STATUS_IDLE)),
+                    "antigravity": _FakeAdapter("antigravity", SessionSummary(app="antigravity", session_id="a1", title="A1", status=STATUS_IDLE)),
+                },
+                bindings=BindingStore(td_path / "bindings.json"),
+                audit=AuditLog(td_path / "audit.jsonl"),
+                watches=WatchStore(td_path / "watches.json"),
+                relays=RelayStore(td_path / "relay_states.sqlite"),
+                writers={
+                    "cline": cline_w,
+                    "codex": codex_w,
+                    "dsh": _FakeWriter("dsh", ready=False),
+                    "antigravity": _FakeWriter("antigravity", ready=False),
+                },
+            )
+            broker = RelayBroker(svc, store=svc.relays, notifier=lambda t, m: (pushes.append((t, m)) or (True, "ok")))
+
+            reg = broker.create_or_update_link(
+                "cline",
+                "cline-prja-1",
+                "codex",
+                "aaaaaaaa-1111-4111-8111-111111111111",
+                name="prja-loop",
+                bidirectional=True,
+                settle_seconds=20,
+                min_hop_interval_seconds=0,
+                max_hops=5,
+                notify_targets="weixin",
+                notify_on_hop=False,
+                notify_on_milestone=True,
+                stop_patterns=[r"阶段关闭"],
+            )
+            self.assertTrue(reg["ok"])
+            rid = reg["relay"]["relay_id"]
+
+            # 1. Baseline snapshot: immediate poll does nothing
+            t0 = 2_000_000_000.0
+            r_base = broker.poll_once(now_ts=t0)
+            self.assertEqual(r_base["actions_count"], 0)
+            self.assertEqual(len(codex_w.sent), 0)
+
+            # 2. Cline produces new report -> debouncing, then changes mid-stream (resets timer), then settles -> silent dispatch!
+            cline_ep.messages.append({"index": 2, "role": "assistant", "content": "Stage 3 初步草稿"})
+            r_d1 = broker.poll_once(now_ts=t0 + 10)
+            self.assertEqual(r_d1["actions"][0]["status"], "debouncing")
+
+            cline_ep.messages.append({"index": 3, "role": "assistant", "content": "Stage 3 完整报告：12/12 校验完成"})
+            r_d2 = broker.poll_once(now_ts=t0 + 20)
+            self.assertEqual(r_d2["actions"][0]["status"], "debouncing")
+            self.assertEqual(len(codex_w.sent), 0)
+
+            r_d3 = broker.poll_once(now_ts=t0 + 35)
+            self.assertEqual(r_d3["actions"][0]["status"], "debouncing")  # only 15s since t0+20
+            self.assertEqual(len(codex_w.sent), 0)
+
+            r_send1 = broker.poll_once(now_ts=t0 + 42)
+            self.assertEqual(r_send1["actions"][0]["status"], "sent")
+            self.assertEqual(len(codex_w.sent), 1)
+            self.assertIn("Stage 3 完整报告", codex_w.sent[0]["text"])
+            self.assertEqual(len(pushes), 0)  # routine hop is SILENT!
+
+            # 3. Codex replies routinely -> B->A silent hop, zero pushes
+            codex_ep.messages.append({"index": 2, "role": "assistant", "content": "请补充 B1 运行细节数据"})
+            broker.poll_once(now_ts=t0 + 50)
+            r_send2 = broker.poll_once(now_ts=t0 + 75)
+            self.assertEqual(r_send2["actions"][0]["direction"], "b_to_a")
+            self.assertEqual(r_send2["actions"][0]["status"], "sent")
+            self.assertEqual(len(cline_w.sent), 1)
+            self.assertEqual(len(pushes), 0)
+
+            # 4. Echo suppression: relayed header message is never bounced back
+            cline_ep.messages.append({"index": 4, "role": "assistant", "content": "[Agent Hub Relay | prja-loop | codex -> cline]\n\necho"})
+            r_echo = broker.poll_once(now_ts=t0 + 80)
+            self.assertEqual(r_echo["actions_count"], 0)
+
+            # 5. Codex emits milestone + stop_pattern -> relays once, pushes 1 formatted Weixin card, auto-pauses!
+            codex_ep.messages.append({"index": 3, "role": "assistant", "content": "终审裁决：Stage 3 验收通过，ALL PASS，阶段关闭。"})
+            broker.poll_once(now_ts=t0 + 90)
+            r_mile = broker.poll_once(now_ts=t0 + 115)
+            self.assertEqual(r_mile["actions"][0]["status"], "sent")
+            self.assertTrue(r_mile["actions"][0]["auto_stopped"])
+            self.assertEqual(len(cline_w.sent), 2)
+            self.assertEqual(len(pushes), 1)
+            self.assertEqual(pushes[0][0], "weixin")
+            self.assertIn("中继自动暂停", pushes[0][1])
+
+            # Subsequent polls do nothing (link disabled, zero duplicate notifications)
+            r_after = broker.poll_once(now_ts=t0 + 150)
+            self.assertEqual(r_after["checked_links"], 0)
+            self.assertEqual(len(pushes), 1)
+
+            # 6. SessionMismatchError during relay -> aborted_mismatch tx + alert card + zero target injection
+            codex_w.mismatch_on_send = True
+            svc.relays.set_enabled(rid, True)
+            cline_ep.messages.append({"index": 5, "role": "assistant", "content": "新的实验请求需要复核"})
+            broker.poll_once(now_ts=t0 + 160)
+            r_mm = broker.poll_once(now_ts=t0 + 185)
+            self.assertEqual(r_mm["actions"][0]["status"], "aborted_mismatch")
+            self.assertEqual(len(pushes), 2)
+            self.assertIn("串台拦截保护", pushes[1][1])
+            txs = svc.relays.recent_transactions(relay_id=rid, limit=10)
+            self.assertTrue(any(tx["status"] == "aborted_mismatch" for tx in txs))
+
+    def test_watcher_cli_once_runs_relay_tick_safely(self) -> None:
+        from agent_hub.watcher import main as watcher_main
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "AGENT_HUB_WATCHES_PATH": str(td_path / "watches.json"),
+                        "AGENT_HUB_RELAY_DB_PATH": str(td_path / "relay_states.sqlite"),
+                    },
+                ),
+                patch("builtins.print") as mock_print,
+            ):
+                watcher_main(["--once", "--dry-run"])
+                self.assertEqual(mock_print.call_count, 1)
+                payload = json.loads(mock_print.call_args[0][0])
+                self.assertIn("checked_count", payload)
+                self.assertIn("relay", payload)
+                self.assertEqual(payload["relay"]["checked_links"], 0)
 
 
 if __name__ == "__main__":

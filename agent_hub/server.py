@@ -15,6 +15,7 @@ from .adapters import AntigravityAdapter, ClineAdapter, CodexAdapter, DshAdapter
 from .audit import AuditLog
 from .bindings import BindingStore
 from .models import ACTIVE_STATUSES, AppAdapter, VALID_APPS, format_local_iso
+from .relay import RelayBroker, RelayStore
 from .summary import extract_task_completion_summary, format_handover_packet
 from .watcher import (
     WatchStore,
@@ -23,6 +24,7 @@ from .watcher import (
     parse_notify_targets,
 )
 from .writers import AntigravityWriter, ClineWriter, CodexWriter, DshWriter, SessionMismatchError
+from .writers.cdp_writer import CdpWriter
 
 
 logging.basicConfig(
@@ -95,6 +97,7 @@ class HubService:
         writers: dict[str, Any] | None = None,
         audit: AuditLog | None = None,
         watches: WatchStore | None = None,
+        relays: RelayStore | None = None,
     ) -> None:
         self.adapters: dict[str, AppAdapter] = adapters or {
             "codex": CodexAdapter(),
@@ -111,6 +114,7 @@ class HubService:
         }
         self.audit = audit or AuditLog()
         self.watches = watches or WatchStore()
+        self.relays = relays or RelayStore()
 
     def _target_apps(self, app: str) -> tuple[list[str], str | None]:
         norm = normalize_app_name(app)
@@ -600,6 +604,22 @@ class HubService:
                     app="cline",
                     session_id=sid,
                     title="VS Code Cline (active task)",
+                    status=STATUS_IDLE,
+                )
+            elif (
+                norm_app == "codex"
+                and _SESSION_ID_PATTERNS[0].match(sid)
+                and isinstance(writer, CdpWriter)
+                and writer.status().get("ready")
+            ):
+                from .models import STATUS_IDLE, SessionSummary
+
+                # ChatGPT Desktop cloud conversation UUID not in local Codex SQLite;
+                # CdpWriter.send_message still enforces strict Fiber/DOM SessionMismatchError verification.
+                meta = SessionSummary(
+                    app="codex",
+                    session_id=sid,
+                    title="",
                     status=STATUS_IDLE,
                 )
             else:
@@ -1166,6 +1186,22 @@ class HubService:
                     title="VS Code Cline (active task)",
                     status=STATUS_IDLE,
                 )
+            elif (
+                norm_app == "codex"
+                and _SESSION_ID_PATTERNS[0].match(sid)
+                and isinstance(writer, CdpWriter)
+                and writer.status().get("ready")
+            ):
+                from .models import STATUS_IDLE, SessionSummary
+
+                # ChatGPT Desktop cloud conversation UUID not in local Codex SQLite;
+                # CdpWriter.send_message still enforces strict Fiber/DOM SessionMismatchError verification.
+                meta = SessionSummary(
+                    app="codex",
+                    session_id=sid,
+                    title="",
+                    status=STATUS_IDLE,
+                )
             else:
                 return {"error": f"Target session '{sid}' not found in '{norm_app}'."}
 
@@ -1283,6 +1319,22 @@ class HubService:
                     app="cline",
                     session_id=sid,
                     title="VS Code Cline (active task)",
+                    status=STATUS_IDLE,
+                )
+            elif (
+                norm_app == "codex"
+                and _SESSION_ID_PATTERNS[0].match(sid)
+                and isinstance(writer, CdpWriter)
+                and writer.status().get("ready")
+            ):
+                from .models import STATUS_IDLE, SessionSummary
+
+                # ChatGPT Desktop cloud conversation UUID not in local Codex SQLite;
+                # CdpWriter.send_message still enforces strict Fiber/DOM SessionMismatchError verification.
+                meta = SessionSummary(
+                    app="codex",
+                    session_id=sid,
+                    title="",
                     status=STATUS_IDLE,
                 )
             else:
@@ -1507,6 +1559,111 @@ class HubService:
         )
         return runner.poll_once(dry_run=dry_run)
 
+    @staticmethod
+    def _parse_pattern_arg(raw: str | list[str] | None) -> list[str] | None:
+        if raw is None:
+            return None
+        if isinstance(raw, list):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+            return items or None
+        txt = str(raw).strip()
+        if not txt:
+            return None
+        items = [part.strip() for part in txt.split(",") if part.strip()]
+        return items or None
+
+    def relay_start(
+        self,
+        source_app: str,
+        source_session_id: str,
+        target_app: str,
+        target_session_id: str,
+        *,
+        name: str = "",
+        bidirectional: bool = True,
+        settle_seconds: int = 20,
+        min_hop_interval_seconds: int = 15,
+        max_hops: int = 20,
+        extract_code_block: bool = False,
+        use_handover_summary: bool = False,
+        prefix_a_to_b: str = "",
+        prefix_b_to_a: str = "",
+        trigger_patterns: str | list[str] = "",
+        milestone_patterns: str | list[str] | None = None,
+        stop_patterns: str | list[str] = "",
+        notify_targets: str = "weixin",
+        notify_on_hop: bool = False,
+        notify_on_milestone: bool = True,
+        mode: str = "queue",
+        model_a: str = "",
+        provider_a: str = "",
+        reasoning_effort_a: str = "",
+        model_b: str = "",
+        provider_b: str = "",
+        reasoning_effort_b: str = "",
+        relay_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Register or update a centralized automated cross-agent relay link."""
+        broker = RelayBroker(self, store=self.relays)
+        return broker.create_or_update_link(
+            source_app,
+            source_session_id,
+            target_app,
+            target_session_id,
+            name=name,
+            bidirectional=bidirectional,
+            settle_seconds=settle_seconds,
+            min_hop_interval_seconds=min_hop_interval_seconds,
+            max_hops=max_hops,
+            extract_code_block=extract_code_block,
+            use_handover_summary=use_handover_summary,
+            prefix_a_to_b=prefix_a_to_b,
+            prefix_b_to_a=prefix_b_to_a,
+            trigger_patterns=self._parse_pattern_arg(trigger_patterns),
+            milestone_patterns=self._parse_pattern_arg(milestone_patterns),
+            stop_patterns=self._parse_pattern_arg(stop_patterns),
+            notify_targets=notify_targets,
+            notify_on_hop=notify_on_hop,
+            notify_on_milestone=notify_on_milestone,
+            mode=mode,
+            model_a=model_a,
+            provider_a=provider_a,
+            reasoning_effort_a=reasoning_effort_a,
+            model_b=model_b,
+            provider_b=provider_b,
+            reasoning_effort_b=reasoning_effort_b,
+            relay_existing=relay_existing,
+        )
+
+    def relay_list(self, *, include_disabled: bool = False, include_recent_tx: int = 5) -> dict[str, Any]:
+        """List registered automated relay links and their recent transaction history."""
+        links = self.relays.list_links(include_disabled=include_disabled)
+        tx_limit = max(0, min(int(include_recent_tx), 50))
+        if tx_limit > 0:
+            for link in links:
+                link["recent_transactions"] = self.relays.recent_transactions(
+                    relay_id=link["relay_id"],
+                    limit=tx_limit,
+                )
+        return {"count": len(links), "relays": links}
+
+    def relay_stop(self, relay_id_or_name: str, *, delete: bool = False) -> dict[str, Any]:
+        """Pause (disable) or delete a registered relay link."""
+        if delete:
+            removed = self.relays.delete_link(relay_id_or_name)
+            if removed is None:
+                return {"ok": False, "error": f"Relay '{relay_id_or_name}' not found"}
+            return {"ok": True, "deleted": True, "relay": removed}
+        updated = self.relays.set_enabled(relay_id_or_name, False)
+        if updated is None:
+            return {"ok": False, "error": f"Relay '{relay_id_or_name}' not found"}
+        return {"ok": True, "deleted": False, "relay": updated}
+
+    def relay_tick(self, *, relay_id: str = "", dry_run: bool = True) -> dict[str, Any]:
+        """Execute one deterministic poll/dispatch cycle across registered relay links."""
+        broker = RelayBroker(self, store=self.relays)
+        return broker.poll_once(relay_id=relay_id, dry_run=dry_run)
+
 
 _SERVICE = HubService()
 
@@ -1515,9 +1672,10 @@ mcp = MCPServer(
     instructions=(
         "Unified session hub for Codex, DeepSeek Harness (dsh), Antigravity, and VS Code Cline. "
         "Supports read-only session inspection with content-body search and fuzzy target locking, "
-        "task alias bindings, sending messages and creating new sessions across all 4 desktop apps "
-        "with optional model/provider/reasoning_effort passthrough, verbatim cross-agent prompt relay "
-        "with dry_run previews, and zero-token watchdog alerts."
+        "task alias bindings, app-level mutex + Two-Phase session-locked sends and session creation across all 4 desktop apps "
+        "with optional model/provider/reasoning_effort passthrough, centralized bi-directional auto-relay "
+        "with debounce and idempotent transaction tracking, verbatim cross-agent prompt relay with dry_run previews, "
+        "remote approval/cancellation, and zero-token watchdog alerts."
     ),
 )
 
@@ -2007,6 +2165,133 @@ def hub_audit_recent(limit: int = 20, app: str = "all", action: str = "") -> str
         action: Optional filter ('send', 'relay', 'create_session', 'respond_approval', 'cancel_session').
     """
     return _dumps(_SERVICE.audit_recent(limit=limit, app=app, action=action))
+
+
+@mcp.tool()
+def hub_relay_start(
+    source_app: str,
+    source_session_id: str,
+    target_app: str,
+    target_session_id: str,
+    name: str = "",
+    bidirectional: bool = True,
+    settle_seconds: int = 20,
+    min_hop_interval_seconds: int = 15,
+    max_hops: int = 20,
+    extract_code_block: bool = False,
+    use_handover_summary: bool = False,
+    prefix_a_to_b: str = "",
+    prefix_b_to_a: str = "",
+    trigger_patterns: str = "",
+    milestone_patterns: str = "",
+    stop_patterns: str = "",
+    notify_targets: str = "weixin",
+    notify_on_hop: bool = False,
+    notify_on_milestone: bool = True,
+    mode: str = "queue",
+    model_a: str = "",
+    provider_a: str = "",
+    reasoning_effort_a: str = "",
+    model_b: str = "",
+    provider_b: str = "",
+    reasoning_effort_b: str = "",
+    relay_existing: bool = False,
+) -> str:
+    """Register or update a centralized, mutex-locked bi-directional (or uni-directional) auto-relay link.
+
+    Args:
+        source_app: Endpoint A app ('codex', 'dsh', 'antigravity', 'cline', or 'alias').
+        source_session_id: Endpoint A concrete session ID or bound alias.
+        target_app: Endpoint B app ('codex', 'dsh', 'antigravity', 'cline', or 'alias').
+        target_session_id: Endpoint B concrete session ID or bound alias.
+        name: Friendly relay link name (e.g. 'proja-loop').
+        bidirectional: If true (default), relay A->B and B->A automatically; if false, only A->B.
+        settle_seconds: Seconds an assistant output must remain unchanged before relay dispatch (default 20).
+        min_hop_interval_seconds: Minimum seconds between consecutive relay hops (default 15).
+        max_hops: Circuit-breaker cap on total hops before auto-pausing (default 20).
+        extract_code_block: Extract main fenced code block when relaying if true.
+        use_handover_summary: Wrap source turn as a structured handover packet if true.
+        prefix_a_to_b: Optional instruction prepended when relaying A -> B.
+        prefix_b_to_a: Optional instruction prepended when relaying B -> A.
+        trigger_patterns: Optional comma-separated keywords/regexes; if set, only matching outputs are relayed.
+        milestone_patterns: Optional comma-separated milestone keywords/regexes (defaults to built-in verdict keywords).
+        stop_patterns: Optional comma-separated keywords/regexes that auto-pause the relay link once matched.
+        notify_targets: Notification channels for milestones/errors/mismatch protection (default 'weixin').
+        notify_on_hop: Push notification on every routine hop (default False for silent flow).
+        notify_on_milestone: Push formatted card once when milestone_patterns match (default True).
+        mode: Target delivery mode ('queue' default, or 'steer' for active DSH turns).
+        model_a: Optional model override when sending to Endpoint A.
+        provider_a: Optional provider override when sending to Endpoint A.
+        reasoning_effort_a: Optional reasoning effort when sending to Endpoint A.
+        model_b: Optional model override when sending to Endpoint B.
+        provider_b: Optional provider override when sending to Endpoint B.
+        reasoning_effort_b: Optional reasoning effort when sending to Endpoint B.
+        relay_existing: If false (default), snapshot existing latest messages so only new replies trigger hops.
+    """
+    return _dumps(
+        _SERVICE.relay_start(
+            source_app=source_app,
+            source_session_id=source_session_id,
+            target_app=target_app,
+            target_session_id=target_session_id,
+            name=name,
+            bidirectional=bidirectional,
+            settle_seconds=settle_seconds,
+            min_hop_interval_seconds=min_hop_interval_seconds,
+            max_hops=max_hops,
+            extract_code_block=extract_code_block,
+            use_handover_summary=use_handover_summary,
+            prefix_a_to_b=prefix_a_to_b,
+            prefix_b_to_a=prefix_b_to_a,
+            trigger_patterns=trigger_patterns,
+            milestone_patterns=milestone_patterns if milestone_patterns.strip() else None,
+            stop_patterns=stop_patterns,
+            notify_targets=notify_targets,
+            notify_on_hop=notify_on_hop,
+            notify_on_milestone=notify_on_milestone,
+            mode=mode,
+            model_a=model_a,
+            provider_a=provider_a,
+            reasoning_effort_a=reasoning_effort_a,
+            model_b=model_b,
+            provider_b=provider_b,
+            reasoning_effort_b=reasoning_effort_b,
+            relay_existing=relay_existing,
+        )
+    )
+
+
+@mcp.tool()
+def hub_relay_list(include_disabled: bool = False, include_recent_tx: int = 5) -> str:
+    """List centralized cross-agent relay links along with recent idempotent transaction records.
+
+    Args:
+        include_disabled: Include paused/disabled relay links if true.
+        include_recent_tx: Number of recent transaction entries to include per link (default 5).
+    """
+    return _dumps(_SERVICE.relay_list(include_disabled=include_disabled, include_recent_tx=include_recent_tx))
+
+
+@mcp.tool()
+def hub_relay_stop(relay_id_or_name: str, delete: bool = False) -> str:
+    """Pause or permanently remove a centralized relay link by relay_id or name.
+
+    Args:
+        relay_id_or_name: Relay ID (e.g. r_1234abcd) or link name.
+        delete: Permanently delete row if true; otherwise pause (enabled=False).
+    """
+    return _dumps(_SERVICE.relay_stop(relay_id_or_name=relay_id_or_name, delete=delete))
+
+
+@mcp.tool()
+def hub_relay_tick(relay_id: str = "", dry_run: bool = True) -> str:
+    """Run an immediate centralized relay poll/dispatch pass without waiting for the daemon interval.
+
+    Args:
+        relay_id: Optional relay ID or link name to tick; ticks all enabled links when omitted.
+        dry_run: Defaults to True (evaluate readiness & preview payload without dispatching or mutating state).
+    """
+    return _dumps(_SERVICE.relay_tick(relay_id=relay_id, dry_run=dry_run))
 
 
 def main() -> None:

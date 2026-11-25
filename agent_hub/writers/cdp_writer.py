@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,12 +11,15 @@ import re
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 import urllib.error
 from urllib.parse import urlparse
 import urllib.request
 
 from ._ws import SimpleWebSocket
+
+
+DEFAULT_LOCK_DIR = Path.home() / ".hermes" / "agent-hub"
 
 
 class SessionMismatchError(RuntimeError):
@@ -26,6 +31,7 @@ class SessionMismatchError(RuntimeError):
         app_name: str,
         expected_session_id: str,
         actual_session_id: str = "",
+        expected_title: str = "",
         actual_url: str = "",
         actual_title: str = "",
         reason: str = "",
@@ -33,13 +39,15 @@ class SessionMismatchError(RuntimeError):
         self.app_name = app_name
         self.expected_session_id = expected_session_id
         self.actual_session_id = actual_session_id
+        self.expected_title = expected_title
         self.actual_url = actual_url
         self.actual_title = actual_title
         self.reason = reason
         msg = (
-            f"{app_name} session mismatch: expected '{expected_session_id}', "
-            f"got '{actual_session_id or 'none'}' "
-            f"(url={actual_url or '-'}, title={actual_title or '-'})"
+            f"{app_name} session mismatch: expected '{expected_session_id}'"
+            + (f" ({expected_title})" if expected_title else "")
+            + f", got '{actual_session_id or 'none'}' "
+            + f"(url={actual_url or '-'}, title={actual_title or '-'})"
         )
         if reason:
             msg += f"; {reason}"
@@ -60,12 +68,19 @@ _EFFORT_ALIASES: dict[str, list[str]] = {
 
 _SESSION_URL_RE = re.compile(r"/(?:c|t)/([A-Za-z0-9_-]{6,})")
 _ANTIGRAVITY_PATH_RE = re.compile(r"^/c/([A-Za-z0-9_-]{6,})/?$")
-_CODEX_PATH_RE = re.compile(r"^/(?:c|t|local)/([A-Za-z0-9_-]{6,})/?$")
+_CODEX_PATH_RE = re.compile(r"^(?:/g/[^/]+)?/(?:c|t|local)/([A-Za-z0-9_-]{6,})/?$")
+_UUID_LIKE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+_GENERIC_TITLES = frozenset(
+    {"", "chatgpt", "codex", "antigravity", "new chat", "new conversation", "新聊天", "新对话", "home", "index"}
+)
+_GENERIC_TITLE_TOKENS = frozenset({"session", "thread", "chat", "task", "conversation", "对话", "会话", "任务"})
 
 _JS_DOM_PRELUDE = """
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const visible = (el) => {
   if (!el) return false;
+  if (el.closest('[hidden], [aria-hidden="true"], [inert]')) return false;
+  if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return false;
   const r = el.getBoundingClientRect();
   const st = window.getComputedStyle(el);
   return r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
@@ -154,9 +169,11 @@ class CdpWriter:
         model_trigger_selectors: list[str] | None = None,
         reasoning_trigger_selectors: list[str] | None = None,
         new_chat_shortcut: dict[str, Any] | None = None,
-        switch_verify_timeout_s: float = 2.5,
+        switch_verify_timeout_s: float = 5.0,
         switch_poll_interval_s: float = 0.15,
         create_url_poll_timeout_s: float = 3.0,
+        lock_dir: Path | None = None,
+        lock_timeout_s: float = 30.0,
     ) -> None:
         self.app_name = app_name
         self.env_port_var = env_port_var
@@ -171,8 +188,56 @@ class CdpWriter:
         self.switch_verify_timeout_s = max(0.05, float(switch_verify_timeout_s))
         self.switch_poll_interval_s = max(0.01, float(switch_poll_interval_s))
         self.create_url_poll_timeout_s = max(0.05, float(create_url_poll_timeout_s))
+        if lock_dir is not None:
+            self._lock_dir = lock_dir
+        else:
+            env_lock_dir = os.environ.get("AGENT_HUB_LOCK_DIR", "").strip()
+            self._lock_dir = Path(env_lock_dir).expanduser() if env_lock_dir else DEFAULT_LOCK_DIR
+        self.lock_timeout_s = max(0.05, float(lock_timeout_s))
         self._lock = threading.Lock()
         self._msg_id = 0
+
+    @contextmanager
+    def _acquire_app_mutex(self) -> Iterator[None]:
+        """Acquire both an in-process thread lock and a cross-process OS flock for this Electron app."""
+        deadline = time.monotonic() + self.lock_timeout_s
+        if not self._lock.acquire(timeout=self.lock_timeout_s):
+            raise TimeoutError(f"{self.app_name} app mutex timed out after {self.lock_timeout_s:.1f}s (thread lock)")
+        fd: int | None = None
+        try:
+            self._lock_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self._lock_dir, 0o700)
+            except OSError:
+                pass
+            lock_path = self._lock_dir / f".cdp-mutex-{self.app_name}.lock"
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"{self.app_name} app mutex timed out after {self.lock_timeout_s:.1f}s (cross-process flock)"
+                        ) from exc
+                    time.sleep(0.05)
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._lock.release()
 
     def _candidate_ports(self) -> list[int]:
         ports: list[int] = []
@@ -610,15 +675,37 @@ class CdpWriter:
             raise RuntimeError(f"{self.app_name} CDP send failed: {res}")
 
         time.sleep(0.25)
+        probe_lines = [
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith(("[via ", "[Agent Hub Relay"))
+        ]
+        probe_text = (probe_lines[0][:28] if probe_lines else text.strip()[:28])
+        verify_cfg = json.dumps({"probe": probe_text})
         verify_script = f"""
         (() => {{
           // __agentHubVerifyPostSend
+          const cfg = {verify_cfg};
           {_JS_DOM_PRELUDE}
           const comp = findComposer();
           const draft = comp ? readDraft(comp).trim() : '';
           const stopBtn = [...document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[data-testid*="stop" i]')]
             .filter(visible)[0];
-          return {{ composer_cleared: draft.length === 0, is_generating: Boolean(stopBtn) }};
+          let messageAppeared = false;
+          const needle = String(cfg.probe || '').trim().toLowerCase();
+          if (needle) {{
+            const turnEls = [...document.querySelectorAll(
+              '[data-testid="user-message-content"], [data-testid="user-message"], [class*="user-message"], [data-message-author-role="user"]'
+            )].filter(visible);
+            messageAppeared = turnEls.some((el) => (el.innerText || el.textContent || '').toLowerCase().includes(needle));
+            if (!messageAppeared) {{
+              const mainEl = document.querySelector('main');
+              if (mainEl) {{
+                messageAppeared = (mainEl.innerText || '').toLowerCase().includes(needle);
+              }}
+            }}
+          }}
+          return {{ composer_cleared: draft.length === 0, is_generating: Boolean(stopBtn), message_appeared: messageAppeared }};
         }})()
         """
         try:
@@ -626,6 +713,8 @@ class CdpWriter:
             if isinstance(verify, dict) and "composer_cleared" in verify:
                 res["composer_cleared"] = bool(verify.get("composer_cleared"))
                 res["is_generating"] = bool(verify.get("is_generating"))
+                if "message_appeared" in verify:
+                    res["message_appeared"] = bool(verify.get("message_appeared"))
         except Exception:  # noqa: BLE001
             pass
         return res
@@ -641,7 +730,7 @@ class CdpWriter:
         reasoning_effort: str = "",
     ) -> dict[str, Any]:
         """Trigger a new conversation/thread via Electron CDP, optionally configure model and send initial_message."""
-        with self._lock:
+        with self._acquire_app_mutex():
             port, pages = self._discover_endpoint()
             if port is None or not pages:
                 raise ConnectionError(
@@ -790,8 +879,37 @@ class CdpWriter:
                 s = s[len(prefix) :].strip()
         return s
 
+    @staticmethod
+    def _normalize_title_text(raw: str) -> str:
+        s = str(raw or "").strip().lower()
+        s = re.sub(r"\s*-\s*(?:antigravity|chatgpt|codex)$", "", s, flags=re.IGNORECASE)
+        s = s.strip("….").strip()
+        return " ".join(s.split())
+
+    @classmethod
+    def _titles_contradict(cls, expected_title: str, actual_title: str) -> bool:
+        """Return True only when both titles are meaningful and clearly refer to different sessions."""
+        exp = cls._normalize_title_text(expected_title)
+        act = cls._normalize_title_text(actual_title)
+        if exp in _GENERIC_TITLES or act in _GENERIC_TITLES:
+            return False
+        if _UUID_LIKE_RE.match(exp) or _UUID_LIKE_RE.match(act):
+            return False
+        if exp == act or exp in act or act in exp:
+            return False
+
+        def _tokens(val: str) -> set[str]:
+            toks = set(re.findall(r"[a-z0-9]{3,}|[\u4e00-\u9fff]{2,}", val))
+            return {t for t in toks if t not in _GENERIC_TITLE_TOKENS}
+
+        exp_toks = _tokens(exp)
+        act_toks = _tokens(act)
+        if not exp_toks or not act_toks:
+            return False
+        return len(exp_toks & act_toks) == 0
+
     def _read_active_session_identity(self, ws: SimpleWebSocket) -> dict[str, Any]:
-        """Inspect the currently active UI session identity via read-only CDP evaluation."""
+        """Inspect the currently active UI session identity via read-only CDP & React Fiber evaluation."""
         if self.app_name == "antigravity":
             script = """
             (() => {
@@ -803,6 +921,7 @@ class CdpWriter:
               } catch {}
               const m = pathname.match(/^\\/c\\/([A-Za-z0-9_-]{6,})\\/?$/);
               const sessionId = m ? m[1] : '';
+              const docTitle = String(document.title || '').replace(/\\s*-\\s*Antigravity$/i, '').trim();
               let title = '';
               if (sessionId) {
                 const row = [...document.querySelectorAll('[data-testid="conversation-row-sidebar"][data-cascade-id]')]
@@ -812,10 +931,8 @@ class CdpWriter:
                   title = (row.innerText || row.textContent || '').trim().split('\\n')[0].trim();
                 }
               }
-              if (!title) {
-                title = String(document.title || '').replace(/\\s*-\\s*Antigravity$/i, '').trim();
-              }
-              return { sessionId, title, href, pathname, source: sessionId ? 'pathname' : 'none' };
+              if (!title) title = docTitle;
+              return { sessionId, title, docTitle, href, pathname, source: sessionId ? 'pathname' : 'none', consistent: true, conflict: '' };
             })()
             """
         else:
@@ -835,57 +952,89 @@ class CdpWriter:
               const isHidden = (el) => {
                 if (!el) return true;
                 if (el.closest('[hidden], [aria-hidden="true"], [inert]')) return true;
+                if (typeof el.checkVisibility === 'function' && !el.checkVisibility()) return true;
                 const st = window.getComputedStyle(el);
                 return st.display === 'none' || st.visibility === 'hidden';
               };
+              const pathRe = /^(?:\\/g\\/[^/]+)?\\/(?:c|t|local)\\/([A-Za-z0-9_-]{6,})\\/?$/;
+              const docTitle = String(document.title || '').trim();
 
-              const pm = pathname.match(/^\\/(?:c|t|local)\\/([A-Za-z0-9_-]{6,})\\/?$/);
-              if (pm) {
-                return {
-                  sessionId: norm(pm[1]),
-                  title: String(document.title || '').trim(),
-                  href,
-                  pathname,
-                  source: 'pathname',
-                };
+              let routerPathname = '';
+              let routerSid = '';
+              const root = document.getElementById('root') || document.getElementById('__next') || document.body?.firstElementChild;
+              const fk = root ? Object.keys(root).find((k) => k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$')) : null;
+              let rootFiber = fk ? root[fk] : null;
+              if (rootFiber && rootFiber.current) rootFiber = rootFiber.current;
+              if (rootFiber) {
+                const visited = new Set();
+                const q = [rootFiber];
+                let steps = 0;
+                while (q.length && steps < 3000) {
+                  const f = q.shift();
+                  if (!f || visited.has(f)) continue;
+                  visited.add(f);
+                  steps += 1;
+                  const p = f.memoizedProps;
+                  const v = p && typeof p === 'object' ? p.value : null;
+                  if (v && typeof v === 'object' && v.router && typeof v.router.navigate === 'function') {
+                    const rp = String(v.router.state?.location?.pathname || v.location?.pathname || '');
+                    const rm = rp.match(pathRe);
+                    if (rm) {
+                      routerPathname = rp;
+                      routerSid = norm(rm[1]);
+                      break;
+                    }
+                  }
+                  if (f.child) q.push(f.child);
+                  if (f.sibling) q.push(f.sibling);
+                }
               }
 
+              const pm = pathname.match(pathRe);
+              const pathnameSid = pm ? norm(pm[1]) : '';
+
+              let sidebarSid = '';
+              let sidebarTitle = '';
+              let sidebarSource = '';
               const activeThread = document.querySelector(
                 '[data-app-action-sidebar-thread-active="true"], [data-app-action-sidebar-thread-selected="true"]'
               );
               if (activeThread) {
                 const sid = norm(activeThread.getAttribute('data-app-action-sidebar-thread-id'));
                 if (sid) {
-                  const ttl = (
+                  sidebarSid = sid;
+                  sidebarSource = 'sidebar-active-thread';
+                  sidebarTitle = (
                     activeThread.getAttribute('data-app-action-sidebar-thread-title')
                     || activeThread.getAttribute('aria-label')
                     || activeThread.innerText
-                    || document.title
                     || ''
                   ).trim();
-                  return { sessionId: sid, title: ttl, href, pathname, source: 'sidebar-active-thread' };
                 }
               }
-
-              const activeChatgpt = document.querySelector(
-                '[data-sidebar-archive-chatgpt-id][aria-current="page"], [data-sidebar-chatgpt-conversation-key][aria-current="page"]'
-              );
-              if (activeChatgpt) {
-                const sid = norm(
-                  activeChatgpt.getAttribute('data-sidebar-archive-chatgpt-id')
-                  || activeChatgpt.getAttribute('data-sidebar-chatgpt-conversation-key')
+              if (!sidebarSid) {
+                const activeChatgpt = document.querySelector(
+                  '[data-sidebar-archive-chatgpt-id][aria-current="page"], [data-sidebar-chatgpt-conversation-key][aria-current="page"]'
                 );
-                if (sid) {
-                  const ttl = (
-                    activeChatgpt.getAttribute('aria-label')
-                    || activeChatgpt.innerText
-                    || document.title
-                    || ''
-                  ).trim();
-                  return { sessionId: sid, title: ttl, href, pathname, source: 'sidebar-active-chatgpt' };
+                if (activeChatgpt) {
+                  const sid = norm(
+                    activeChatgpt.getAttribute('data-sidebar-archive-chatgpt-id')
+                    || activeChatgpt.getAttribute('data-sidebar-chatgpt-conversation-key')
+                  );
+                  if (sid) {
+                    sidebarSid = sid;
+                    sidebarSource = 'sidebar-active-chatgpt';
+                    sidebarTitle = (
+                      activeChatgpt.getAttribute('aria-label')
+                      || activeChatgpt.innerText
+                      || ''
+                    ).trim();
+                  }
                 }
               }
 
+              let domSid = '';
+              let domSource = '';
               const domQueries = [
                 ['[data-above-composer-conversation-id]', 'data-above-composer-conversation-id', 'composer-above-dom'],
                 ['[data-map-composer-conversation]', 'data-map-composer-conversation', 'composer-map-dom'],
@@ -897,23 +1046,49 @@ class CdpWriter:
                   if (isHidden(el)) continue;
                   const sid = norm(el.getAttribute(attr));
                   if (sid) {
-                    return {
-                      sessionId: sid,
-                      title: String(document.title || '').trim(),
-                      href,
-                      pathname,
-                      source: src,
-                    };
+                    domSid = sid;
+                    domSource = src;
+                    break;
                   }
                 }
+                if (domSid) break;
+              }
+
+              let sessionId = '';
+              let source = 'none';
+              if (routerSid) {
+                sessionId = routerSid;
+                source = 'router-fiber';
+              } else if (pathnameSid) {
+                sessionId = pathnameSid;
+                source = 'pathname';
+              } else if (sidebarSid) {
+                sessionId = sidebarSid;
+                source = sidebarSource;
+              } else if (domSid) {
+                sessionId = domSid;
+                source = domSource;
+              }
+
+              let consistent = true;
+              let conflict = '';
+              if (routerSid && sidebarSid && routerSid !== sidebarSid) {
+                consistent = false;
+                conflict = 'router=' + routerSid + ' vs sidebar=' + sidebarSid;
+              } else if (routerSid && pathnameSid && routerSid !== pathnameSid) {
+                consistent = false;
+                conflict = 'router=' + routerSid + ' vs pathname=' + pathnameSid;
               }
 
               return {
-                sessionId: '',
-                title: String(document.title || '').trim(),
+                sessionId,
+                title: sidebarTitle || docTitle,
+                docTitle,
                 href,
-                pathname,
-                source: 'none',
+                pathname: routerPathname || pathname,
+                source,
+                consistent,
+                conflict,
               };
             })()
             """
@@ -936,20 +1111,39 @@ class CdpWriter:
         return {
             "session_id": sid,
             "title": str(data.get("title") or "").strip(),
+            "doc_title": str(data.get("docTitle") or data.get("title") or "").strip(),
             "url": url,
             "pathname": pathname,
             "source": str(data.get("source") or ("pathname" if sid else "none")),
+            "consistent": bool(data.get("consistent", True)),
+            "conflict": str(data.get("conflict") or "").strip(),
         }
 
-    def _matches_target_session(self, identity: dict[str, Any], expected_session_id: str) -> bool:
+    def _matches_target_session(
+        self,
+        identity: dict[str, Any],
+        expected_session_id: str,
+        *,
+        expected_title: str = "",
+    ) -> bool:
+        if not identity.get("consistent", True):
+            return False
         expected = self._normalize_session_id(expected_session_id)
         if not expected:
             return False
         actual_sid = self._normalize_session_id(identity.get("session_id"))
         if self.app_name == "antigravity":
             pathname = str(identity.get("pathname") or "").rstrip("/")
-            return pathname == f"/c/{expected}" and actual_sid == expected
-        return actual_sid == expected
+            matched = pathname == f"/c/{expected}" and actual_sid == expected
+        else:
+            matched = actual_sid == expected
+        if not matched:
+            return False
+        if expected_title:
+            actual_title = str(identity.get("doc_title") or identity.get("title") or "").strip()
+            if self._titles_contradict(expected_title, actual_title):
+                return False
+        return True
 
     def _select_page(self, pages: list[dict[str, Any]], expected_sid: str, target_title: str) -> dict[str, Any]:
         target = pages[0]
@@ -974,9 +1168,17 @@ class CdpWriter:
         ws: SimpleWebSocket,
         expected_sid: str,
         target_title: str = "",
+        *,
+        raw_session_id: str = "",
     ) -> tuple[dict[str, Any], bool, str]:
-        """Verify active UI session matches expected_sid or switch via sidebar, failing closed."""
-        js_payload = json.dumps({"targetTitle": target_title, "sessionId": expected_sid})
+        """Verify active UI session matches expected_sid or switch via sidebar/Fiber navigate, failing closed."""
+        js_payload = json.dumps(
+            {
+                "targetTitle": target_title,
+                "sessionId": expected_sid,
+                "rawSessionId": raw_session_id or expected_sid,
+            }
+        )
         switch_script = f"""
         (async () => {{
           const cfg = {js_payload};
@@ -1017,16 +1219,78 @@ class CdpWriter:
             }}
             return null;
           }};
+          const fiberNavigate = (sid, rawSid) => {{
+            if (!sid) return null;
+            const root = document.getElementById('root') || document.getElementById('__next') || document.body?.firstElementChild;
+            const fk = root ? Object.keys(root).find((k) => k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$')) : null;
+            let rootFiber = fk ? root[fk] : null;
+            if (rootFiber && rootFiber.current) rootFiber = rootFiber.current;
+            if (!rootFiber) return null;
+            let routerNav = null;
+            let navPush = null;
+            let propsNav = null;
+            let scopedPath = '';
+            const visited = new Set();
+            const q = [rootFiber];
+            let steps = 0;
+            while (q.length && steps < 4000) {{
+              const f = q.shift();
+              if (!f || visited.has(f)) continue;
+              visited.add(f);
+              steps += 1;
+              const p = f.memoizedProps;
+              if (p && typeof p === 'object') {{
+                if (typeof p.navigate === 'function' && !propsNav) propsNav = p.navigate;
+                const v = p.value;
+                if (v && typeof v === 'object') {{
+                  if (v.router && typeof v.router.navigate === 'function' && !routerNav) routerNav = v.router;
+                  if (v.navigator && typeof v.navigator.push === 'function' && !navPush) navPush = v.navigator;
+                  const lp = String(v.location?.pathname || v.router?.state?.location?.pathname || '');
+                  if (lp && (lp.endsWith('/' + sid) || lp.includes('/c/' + sid) || lp.includes('/local/' + sid))) {{
+                    scopedPath = lp;
+                  }}
+                }}
+              }}
+              if (f.child) q.push(f.child);
+              if (f.sibling) q.push(f.sibling);
+            }}
+            const defaultPath = String(rawSid || '').startsWith('local:') ? ('/local/' + sid) : ('/c/' + sid);
+            const targetPath = scopedPath || defaultPath;
+            if (routerNav) {{
+              routerNav.navigate(targetPath);
+              return {{ method: 'fiber-router-navigate', navigatedTo: targetPath }};
+            }}
+            if (navPush) {{
+              navPush.push(targetPath);
+              return {{ method: 'fiber-navigator-push', navigatedTo: targetPath }};
+            }}
+            if (propsNav) {{
+              propsNav(targetPath);
+              return {{ method: 'fiber-props-navigate', navigatedTo: targetPath }};
+            }}
+            return null;
+          }};
 
           let hit = findBySessionId(cfg.sessionId);
-          if (!hit) {{
-            const sidebarToggle = [...document.querySelectorAll('[data-testid="sidebar-toggle"], button[aria-label*="Sidebar" i], button[aria-label*="侧边栏"]')]
-              .filter(visible)[0];
-            if (sidebarToggle) {{
-              sidebarToggle.click();
-              await sleep(250);
-              hit = findBySessionId(cfg.sessionId);
-            }}
+          if (hit && hit.el) {{
+            hit.el.click();
+            await sleep(250);
+            return {{ ok: true, switched: true, switchMethod: hit.method }};
+          }}
+
+          const navRes = fiberNavigate(cfg.sessionId, cfg.rawSessionId);
+          if (navRes) {{
+            await sleep(250);
+            return {{ ok: true, switched: true, switchMethod: navRes.method, navigatedTo: navRes.navigatedTo }};
+          }}
+
+          const sidebarToggle = [...document.querySelectorAll('[data-testid="sidebar-toggle"], button[aria-label*="Sidebar" i], button[aria-label*="侧边栏"]')]
+            .filter(visible)[0];
+          if (sidebarToggle) {{
+            sidebarToggle.click();
+            await sleep(250);
+            hit = findBySessionId(cfg.sessionId);
+            if (hit) hit.method = 'sidebar-' + hit.method;
           }}
 
           if (!hit && cfg.targetTitle) {{
@@ -1058,7 +1322,7 @@ class CdpWriter:
         switched = False
         switch_method = "already-active"
 
-        if not self._matches_target_session(identity, expected_sid):
+        if not self._matches_target_session(identity, expected_sid, expected_title=target_title):
             sw_res = self._cdp_eval(ws, switch_script, await_promise=True)
             if not isinstance(sw_res, dict) or not sw_res.get("ok"):
                 raise RuntimeError(f"{self.app_name} CDP switch failed: {sw_res}")
@@ -1069,27 +1333,40 @@ class CdpWriter:
                 deadline = time.monotonic() + self.switch_verify_timeout_s
                 while True:
                     identity = self._read_active_session_identity(ws)
-                    if self._matches_target_session(identity, expected_sid):
-                        break
+                    if self._matches_target_session(identity, expected_sid, expected_title=target_title):
+                        # Double-confirm stability gate to ensure React Router did not bounce back.
+                        time.sleep(min(self.switch_poll_interval_s, 0.15))
+                        identity = self._read_active_session_identity(ws)
+                        if self._matches_target_session(identity, expected_sid, expected_title=target_title):
+                            break
                     if time.monotonic() >= deadline:
                         break
                     time.sleep(self.switch_poll_interval_s)
             else:
                 identity = self._read_active_session_identity(ws)
 
-            if not self._matches_target_session(identity, expected_sid):
+            if not self._matches_target_session(identity, expected_sid, expected_title=target_title):
+                conflict = str(identity.get("conflict") or "").strip()
+                actual_title = str(identity.get("doc_title") or identity.get("title") or "").strip()
+                if conflict:
+                    reason = f"inconsistent UI state ({conflict})"
+                elif self._normalize_session_id(identity.get("session_id")) == expected_sid and target_title and self._titles_contradict(target_title, actual_title):
+                    reason = f"title contradiction: expected '{target_title}' vs actual '{actual_title}'"
+                elif switched:
+                    reason = (
+                        f"session switch did not stabilize on target within {self.switch_verify_timeout_s:.1f}s "
+                        f"(switch_method={switch_method})"
+                    )
+                else:
+                    reason = "could not locate target session via sidebar or Fiber router"
                 raise SessionMismatchError(
                     app_name=self.app_name,
                     expected_session_id=expected_sid,
+                    expected_title=target_title,
                     actual_session_id=str(identity.get("session_id") or ""),
                     actual_url=str(identity.get("url") or ""),
-                    actual_title=str(identity.get("title") or ""),
-                    reason=(
-                        f"session switch did not land on target within {self.switch_verify_timeout_s:.1f}s "
-                        f"(switch_method={switch_method})"
-                        if switched
-                        else "could not locate target session in sidebar to switch"
-                    ),
+                    actual_title=actual_title,
+                    reason=reason,
                 )
         return identity, switched, switch_method
 
@@ -1109,7 +1386,7 @@ class CdpWriter:
         if not expected_sid:
             raise ValueError(f"{self.app_name} send_message requires a non-empty session_id")
 
-        with self._lock:
+        with self._acquire_app_mutex():
             port, pages = self._discover_endpoint()
             if port is None or not pages:
                 raise ConnectionError(
@@ -1149,7 +1426,12 @@ class CdpWriter:
                 if not isinstance(pre_draft, dict) or not pre_draft.get("ok"):
                     raise RuntimeError(f"{self.app_name} CDP send prep failed: {pre_draft}")
 
-                _, switched, switch_method = self._ensure_target_session(ws, expected_sid, target_title)
+                _, switched, switch_method = self._ensure_target_session(
+                    ws,
+                    expected_sid,
+                    target_title,
+                    raw_session_id=session_id,
+                )
 
                 composer_check = self._cdp_eval(ws, post_switch_composer_script, await_promise=False)
                 if not isinstance(composer_check, dict) or not composer_check.get("ok"):
@@ -1163,14 +1445,15 @@ class CdpWriter:
                 )
 
                 final_identity = self._read_active_session_identity(ws)
-                if not self._matches_target_session(final_identity, expected_sid):
+                if not self._matches_target_session(final_identity, expected_sid, expected_title=target_title):
                     raise SessionMismatchError(
                         app_name=self.app_name,
                         expected_session_id=expected_sid,
+                        expected_title=target_title,
                         actual_session_id=str(final_identity.get("session_id") or ""),
                         actual_url=str(final_identity.get("url") or ""),
-                        actual_title=str(final_identity.get("title") or ""),
-                        reason="active session drifted prior to text injection",
+                        actual_title=str(final_identity.get("doc_title") or final_identity.get("title") or ""),
+                        reason=final_identity.get("conflict") or "active session drifted prior to text injection",
                     )
 
                 res = self._cdp_inject_and_send(ws, text)
@@ -1195,6 +1478,132 @@ class CdpWriter:
                 out["modelSelection"] = model_selection
             return out
 
+    _PUA_BLOCK_RE = re.compile(r"[\ue000-\ue2ff][\s\S]*?\ue201")
+    _PUA_CHAR_RE = re.compile(r"[\ue000-\uf8ff]")
+
+    @classmethod
+    def _clean_live_text(cls, text: str) -> str:
+        """Strip ChatGPT private-use widget markers and collapse excess blank lines."""
+        cleaned = cls._PUA_BLOCK_RE.sub(" ", str(text or ""))
+        cleaned = cls._PUA_CHAR_RE.sub("", cleaned)
+        cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def read_live_session(
+        self,
+        session_id: str,
+        *,
+        target_title: str = "",
+        tail_messages: int = 10,
+        max_chars_per_message: int = 8000,
+    ) -> dict[str, Any]:
+        """Switch to and verify target Electron session under mutex, then read full turns.
+
+        Extraction prefers the React Fiber conversation model (mp.turns with
+        contentReferences/fallbackMarkdown), which carries the complete assistant
+        markdown even when the DOM truncates or collapses long responses, and falls
+        back to rendered DOM nodes only when Fiber data is unavailable. The
+        previously active session is restored in a finally block so automated
+        cross-session reads never leave the desktop parked away from the user's
+        working conversation.
+        """
+        expected_sid = self._normalize_session_id(session_id)
+        if not expected_sid:
+            raise ValueError(f"{self.app_name} read_live_session requires a non-empty session_id")
+
+        with self._acquire_app_mutex():
+            port, pages = self._discover_endpoint()
+            if port is None or not pages:
+                raise ConnectionError(
+                    f"{self.app_name} CDP is not active. Relaunch with {self.launcher_hint} to read live UI sessions."
+                )
+
+            target = self._select_page(pages, expected_sid, target_title)
+            ws_url = str(target["webSocketDebuggerUrl"])
+            read_cfg = json.dumps({"tailMessages": max(1, int(tail_messages)), "sessionId": expected_sid})
+            dom_read_script = _READ_LIVE_SESSION_SCRIPT.replace("__READ_CFG__", read_cfg).replace(
+                "__JS_DOM_PRELUDE__", _JS_DOM_PRELUDE
+            )
+
+            with SimpleWebSocket(ws_url, timeout=15.0) as ws:
+                try:
+                    prev_identity = self._read_active_session_identity(ws)
+                except Exception:  # noqa: BLE001
+                    prev_identity = {}
+                identity, switched, switch_method = self._ensure_target_session(
+                    ws,
+                    expected_sid,
+                    target_title,
+                    raw_session_id=session_id,
+                )
+                try:
+                    # Brief retry so the React tree finishes mounting the switched
+                    # conversation before extraction; refuse stale turns from the
+                    # previous conversation by conversationId match.
+                    data: dict[str, Any] = {}
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        raw = self._cdp_eval(ws, dom_read_script, await_promise=False)
+                        data = raw if isinstance(raw, dict) else {}
+                        if data.get("source") == "fiber" or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.15)
+                finally:
+                    if switched:
+                        prev_sid = self._normalize_session_id(prev_identity.get("session_id"))
+                        prev_title = str(prev_identity.get("doc_title") or prev_identity.get("title") or "").strip()
+                        if prev_sid and prev_sid != expected_sid:
+                            try:
+                                self._ensure_target_session(ws, prev_sid, prev_title)
+                            except Exception:  # noqa: BLE001
+                                pass
+
+            raw_msgs = data.get("messages") or []
+            out_msgs: list[dict[str, Any]] = []
+            for m in raw_msgs:
+                if not isinstance(m, dict):
+                    continue
+                content = self._clean_live_text(str(m.get("content") or ""))
+                truncated = False
+                if max_chars_per_message > 0 and len(content) > max_chars_per_message:
+                    content = content[:max_chars_per_message]
+                    truncated = True
+                if not content:
+                    continue
+                entry: dict[str, Any] = {
+                    "index": int(m.get("index") or (len(out_msgs) + 1)),
+                    "role": str(m.get("role") or "assistant"),
+                    "content": content,
+                }
+                if truncated:
+                    entry["truncated"] = True
+                out_msgs.append(entry)
+
+            verified_title = str(identity.get("title") or target_title or expected_sid).strip()
+            is_generating = bool(data.get("is_generating"))
+            return {
+                "session": {
+                    "app": self.app_name,
+                    "session_id": expected_sid,
+                    "title": verified_title,
+                    "status": "running" if is_generating else "idle",
+                    "status_detail": "generating in UI" if is_generating else "",
+                    "workspace": "",
+                    "updated_at": "",
+                    "updated_at_ms": int(time.time() * 1000),
+                    "preview": out_msgs[-1]["content"][:140] if out_msgs else "",
+                    "extra": {"source": "live-cdp", "port": port, "extraction": str(data.get("source") or "dom")},
+                },
+                "message_count_returned": len(out_msgs),
+                "messages": out_msgs,
+                "is_generating": is_generating,
+                "verified_session_id": expected_sid,
+                "verified_title": verified_title,
+                "switched": switched,
+                "switch_method": switch_method,
+            }
+
     @staticmethod
     def _normalize_decision(decision: str) -> str:
         raw = (decision or "").strip().lower()
@@ -1218,7 +1627,7 @@ class CdpWriter:
             raise ValueError(f"{self.app_name} respond_approval requires a non-empty session_id")
         norm_decision = self._normalize_decision(decision)
 
-        with self._lock:
+        with self._acquire_app_mutex():
             port, pages = self._discover_endpoint()
             if port is None or not pages:
                 raise ConnectionError(
@@ -1323,7 +1732,7 @@ class CdpWriter:
         if not expected_sid:
             raise ValueError(f"{self.app_name} cancel_session requires a non-empty session_id")
 
-        with self._lock:
+        with self._acquire_app_mutex():
             port, pages = self._discover_endpoint()
             if port is None or not pages:
                 raise ConnectionError(
@@ -1446,3 +1855,159 @@ class CodexWriter(CdpWriter):
             ],
             new_chat_shortcut={"key": "n", "code": "KeyN", "modifiers": 4, "windowsVirtualKeyCode": 78},
         )
+
+
+_READ_LIVE_SESSION_SCRIPT = r"""
+(() => {
+  // __agentHubReadLiveMessages
+  const cfg = __READ_CFG__;
+  __JS_DOM_PRELUDE__
+  const cleanText = (t) => String(t || '')
+    .replace(/[\ue000-\ue2ff][\s\S]*?\ue201/g, ' ')
+    .replace(/[\ue000-\uf8ff]/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  const refText = (r) => {
+    if (!r || typeof r !== 'object') return '';
+    const dil = r.model_dil_v2;
+    if (dil && typeof dil.fallbackMarkdown === 'string' && dil.fallbackMarkdown.trim()) return dil.fallbackMarkdown;
+    if (typeof r.matched_text === 'string' && r.matched_text.trim()) return r.matched_text;
+    if (typeof r.text === 'string' && r.text.trim()) return r.text;
+    return '';
+  };
+  const expandAssistant = (it) => {
+    let content = typeof it.content === 'string' ? it.content : '';
+    const refs = Array.isArray(it.contentReferences) ? it.contentReferences : [];
+    const ordered = refs
+      .filter((r) => r && typeof r === 'object')
+      .sort((a, b) => Number(a.start_idx || 0) - Number(b.start_idx || 0));
+    const bodies = [];
+    let seq = 0;
+    content = content.replace(/::chatgpt-content-reference\{[^}]*\}/g, () => {
+      const r = ordered[seq++] || null;
+      const body = r ? refText(r) : '';
+      if (!body) return '';
+      bodies.push(body);
+      return '\n' + body + '\n';
+    });
+    const seenHeads = new Set(bodies.map((b) => b.slice(0, 120)));
+    for (const r of ordered) {
+      const body = refText(r);
+      if (!body) continue;
+      const head = body.slice(0, 120);
+      if (seenHeads.has(head)) continue;
+      if (body.length > 80 && content.includes(body.slice(0, 80))) continue;
+      seenHeads.add(head);
+      content = content ? (content + '\n\n' + body) : body;
+    }
+    return cleanText(content);
+  };
+  const expandUser = (it) => {
+    if (typeof it.message === 'string') return cleanText(it.message);
+    const msg = it.message;
+    if (msg && typeof msg === 'object') {
+      const c = msg.content;
+      if (typeof c === 'string') return cleanText(c);
+      if (Array.isArray(c)) return cleanText(c.map((x) => (x && typeof x.text === 'string' ? x.text : '')).join('\n'));
+    }
+    if (typeof it.authoredPrompt === 'string') return cleanText(it.authoredPrompt);
+    return '';
+  };
+  const readFiberTurns = (expectedId) => {
+    const rootEl = document.getElementById('root') || document.body;
+    if (!rootEl) return null;
+    const fk = Object.keys(rootEl).find((k) => k.startsWith('__reactContainer$') || k.startsWith('__reactFiber$'));
+    let rf = fk ? rootEl[fk] : null;
+    if (rf && rf.current) rf = rf.current;
+    if (!rf) return null;
+    const visited = new Set();
+    const q = [rf];
+    let steps = 0;
+    while (q.length && steps < 15000) {
+      const f = q.shift();
+      steps += 1;
+      if (!f || visited.has(f)) continue;
+      visited.add(f);
+      const mp = f.memoizedProps;
+      if (mp && typeof mp === 'object' && Array.isArray(mp.turns) && mp.turns.length > 0) {
+        const cid = mp.turns[0] && mp.turns[0].conversationId;
+        if (!expectedId || cid === expectedId) return mp.turns;
+      }
+      if (f.child) q.push(f.child);
+      if (f.sibling) q.push(f.sibling);
+    }
+    return null;
+  };
+  const stopBtn = [...document.querySelectorAll('button[aria-label*="Stop" i], button[aria-label*="停止"], button[data-testid*="stop" i]')]
+    .filter(visible)[0];
+  const messages = [];
+  let source = 'dom';
+  const turns = readFiberTurns(cfg.sessionId);
+  if (turns) {
+    for (const t of turns) {
+      const items = (t && t.turn && Array.isArray(t.turn.items)) ? t.turn.items : [];
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        if (it.type === 'user-message') {
+          const txt = expandUser(it);
+          if (txt) messages.push({ role: 'user', content: txt });
+        } else if (it.type === 'assistant-message') {
+          if (it.completed === false) continue;
+          const txt = expandAssistant(it);
+          if (txt) messages.push({ role: 'assistant', content: txt });
+        }
+      }
+    }
+  }
+  if (messages.length > 0) {
+    source = 'fiber';
+  } else {
+    const pushMsg = (role, rawText) => {
+      let txt = String(rawText || '').trim();
+      if (!txt) return;
+      if (role === 'user') txt = txt.replace(/^(?:你说：|You said)\s*/i, '').trim();
+      if (!txt) return;
+      messages.push({ role, content: txt });
+    };
+    const chatTurns = [...document.querySelectorAll('[data-content-search-turn-key]')].filter(visible);
+    if (chatTurns.length > 0) {
+      for (const turn of chatTurns) {
+        const userEl = turn.querySelector('[class*="user-message"], [data-message-author-role="user"]');
+        const userText = userEl ? (userEl.innerText || '').trim() : '';
+        if (userText) pushMsg('user', userText);
+        const assistEls = [...turn.querySelectorAll('[data-message-author-role="assistant"], [class*="markdown"], .prose, [data-testid="chatgpt-writing-block"]')]
+          .filter((el) => visible(el) && !el.closest('[class*="user-message"], [data-message-author-role="user"]'));
+        const topAssist = assistEls.filter((el) => !assistEls.some((other) => other !== el && other.contains(el)));
+        if (topAssist.length > 0) {
+          const joined = topAssist.map((el) => (el.innerText || '').trim()).filter(Boolean).join('\n\n');
+          if (joined) pushMsg('assistant', joined);
+        } else {
+          const fullTxt = (turn.innerText || '').trim();
+          if (fullTxt && userText && fullTxt.length > userText.length + 4) {
+            const rest = fullTxt.replace(userText, '').trim();
+            if (rest) pushMsg('assistant', rest);
+          } else if (fullTxt && !userText) {
+            pushMsg('assistant', fullTxt);
+          }
+        }
+      }
+    } else {
+      const turnNodes = [...document.querySelectorAll(
+        '[data-testid="user-message-content"], [data-message-author-role="user"], [data-message-author-role="assistant"], [data-testid="assistant-message"]'
+      )].filter(visible);
+      for (const el of turnNodes) {
+        const tid = String(el.getAttribute('data-testid') || '');
+        const roleAttr = String(el.getAttribute('data-message-author-role') || '');
+        const role = (roleAttr === 'user' || tid.includes('user')) ? 'user' : 'assistant';
+        pushMsg(role, el.innerText || el.textContent || '');
+      }
+    }
+  }
+  return {
+    source,
+    is_generating: Boolean(stopBtn),
+    messages: messages.slice(-cfg.tailMessages).map((m, i) => ({ index: i + 1, role: m.role, content: m.content })),
+  };
+})()
+"""

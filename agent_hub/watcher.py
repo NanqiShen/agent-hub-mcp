@@ -590,8 +590,9 @@ def default_hermes_verify(
     *,
     model: str = "",
     reasoning: str = "low",
-    toolsets: str = "",
-    timeout: int = 45,
+    toolsets: str = "terminal",
+    provider: str = "",
+    timeout: int = 90,
     hermes_bin: str = "",
 ) -> dict[str, Any]:
     """Run an on-demand single-turn `hermes -z` verification pass; fail-open on errors."""
@@ -602,6 +603,8 @@ def default_hermes_verify(
     cmd: list[str] = [bin_path]
     if model.strip():
         cmd.extend(["-m", model.strip()])
+    if provider.strip():
+        cmd.extend(["--provider", provider.strip()])
     if reasoning.strip():
         cmd.extend(["--reasoning", reasoning.strip()])
     if toolsets.strip():
@@ -664,7 +667,9 @@ class WatchdogRunner:
         suppress_routine: bool = False,
         verify_model: str = "",
         verify_reasoning: str = "low",
-        verify_timeout: int = 45,
+        verify_toolsets: str = "terminal",
+        verify_provider: str = "",
+        verify_timeout: int = 90,
         debounce_seconds: int = 0,
     ) -> None:
         self.adapters: dict[str, AppAdapter] = adapters or {
@@ -683,6 +688,8 @@ class WatchdogRunner:
         self.suppress_routine = bool(suppress_routine)
         self.verify_model = (verify_model or "").strip()
         self.verify_reasoning = (verify_reasoning or "low").strip()
+        self.verify_toolsets = (verify_toolsets or "").strip()
+        self.verify_provider = (verify_provider or "").strip()
         self.verify_timeout = max(5, int(verify_timeout))
         self.debounce_seconds = max(0, int(debounce_seconds))
         if verifier is not None:
@@ -692,6 +699,8 @@ class WatchdogRunner:
                 ctx,
                 model=self.verify_model,
                 reasoning=self.verify_reasoning,
+                toolsets=self.verify_toolsets,
+                provider=self.verify_provider,
                 timeout=self.verify_timeout,
             )
 
@@ -1092,6 +1101,16 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional model override passed to `hermes -m ... -z` during Level-2 verification",
     )
     ap.add_argument(
+        "--verify-provider",
+        default=os.environ.get("AGENT_HUB_WATCHER_VERIFY_PROVIDER", ""),
+        help="Optional provider override passed to `hermes --provider ... -z` during Level-2 verification",
+    )
+    ap.add_argument(
+        "--verify-toolsets",
+        default=os.environ.get("AGENT_HUB_WATCHER_VERIFY_TOOLSETS", "terminal"),
+        help="Toolset filter for the Level-2 `hermes -z` call (default: terminal; keeps MCP servers out)",
+    )
+    ap.add_argument(
         "--verify-reasoning",
         default=os.environ.get("AGENT_HUB_WATCHER_VERIFY_REASONING", "low"),
         help="Reasoning level for Level-2 `hermes -z` verification (default: low)",
@@ -1099,8 +1118,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument(
         "--verify-timeout",
         type=int,
-        default=int(os.environ.get("AGENT_HUB_WATCHER_VERIFY_TIMEOUT", "45") or 45),
-        help="Timeout in seconds for Level-2 `hermes -z` verification (default: 45)",
+        default=int(os.environ.get("AGENT_HUB_WATCHER_VERIFY_TIMEOUT", "90") or 90),
+        help="Timeout in seconds for Level-2 `hermes -z` verification (default: 90)",
     )
     ap.add_argument(
         "--suppress-routine",
@@ -1114,6 +1133,11 @@ def main(argv: list[str] | None = None) -> None:
         default=int(os.environ.get("AGENT_HUB_WATCHER_DEBOUNCE_SECONDS", str(DEFAULT_DAEMON_DEBOUNCE_SECONDS)) or DEFAULT_DAEMON_DEBOUNCE_SECONDS),
         help="Seconds a transient error/completed state must persist across consecutive polls (default: 25)",
     )
+    ap.add_argument(
+        "--no-relay",
+        action="store_true",
+        help="Disable centralized bi-directional relay broker ticks inside the watcher loop",
+    )
     args = ap.parse_args(argv)
 
     runner = WatchdogRunner(
@@ -1122,11 +1146,23 @@ def main(argv: list[str] | None = None) -> None:
         suppress_routine=bool(args.suppress_routine),
         verify_model=args.verify_model,
         verify_reasoning=args.verify_reasoning,
+        verify_toolsets=args.verify_toolsets,
+        verify_provider=args.verify_provider,
         verify_timeout=args.verify_timeout,
         debounce_seconds=args.debounce_seconds,
     )
+    relay_broker = None
+    if not args.no_relay:
+        from .relay import RelayBroker
+        from .server import HubService
+
+        relay_service = HubService(adapters=runner.adapters, watches=runner.store)
+        relay_broker = RelayBroker(relay_service, notifier=runner.notifier)
+
     if args.once:
         res = runner.poll_once(dry_run=args.dry_run)
+        if relay_broker is not None:
+            res["relay"] = relay_broker.poll_once(dry_run=args.dry_run)
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return
 
@@ -1142,11 +1178,12 @@ def main(argv: list[str] | None = None) -> None:
 
     interval = max(5, int(args.interval))
     logger.info(
-        "Agent Hub watchdog started (interval=%ss, debounce=%ss, verify_agent=%s, suppress_routine=%s, store=%s)",
+        "Agent Hub watchdog started (interval=%ss, debounce=%ss, verify_agent=%s, suppress_routine=%s, relay=%s, store=%s)",
         interval,
         runner.debounce_seconds,
         runner.verify_agent,
         runner.suppress_routine,
+        relay_broker is not None,
         runner.store.path,
     )
     while not stop_requested:
@@ -1158,6 +1195,19 @@ def main(argv: list[str] | None = None) -> None:
                 logger.warning("Watch poll errors: %s", res["errors"])
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected watcher cycle failure: %s", exc)
+
+        if relay_broker is not None:
+            try:
+                rres = relay_broker.poll_once(dry_run=args.dry_run)
+                if rres.get("actions"):
+                    logger.info(
+                        "Relay cycle actions: %s",
+                        [(a.get("relay_id"), a.get("direction"), a.get("status")) for a in rres["actions"]],
+                    )
+                if rres.get("errors"):
+                    logger.warning("Relay poll errors: %s", rres["errors"])
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Unexpected relay cycle failure: %s", exc)
 
         # Sleep in short increments for prompt signal exit
         slept = 0

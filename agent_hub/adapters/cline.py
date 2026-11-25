@@ -192,6 +192,41 @@ class ClineAdapter:
                     pass
         return None
 
+    @classmethod
+    def _last_round_completed(cls, paths: dict[str, str]) -> bool:
+        """Return True when the newest persisted message is a finished assistant turn.
+
+        Used to distinguish a stale reconciler exit (process died after the round's
+        final answer, e.g. an extension-host restart) from a real mid-task failure.
+        Pending asks, partial records, and user-last records keep the error state.
+        """
+        for key in ("messages_path", "ui_messages_path"):
+            raw = paths.get(key)
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.exists():
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            items = data.get("messages") if isinstance(data, dict) else data
+            if not isinstance(items, list) or not items:
+                continue
+            for it in reversed(items):
+                if not isinstance(it, dict) or it.get("partial") is True:
+                    continue
+                if it.get("type") == "ask" or it.get("ask") or it.get("approval_pending") is True:
+                    return False
+                if it.get("type") == "say":
+                    return str(it.get("say") or "text").strip().lower() in ("", "text", "completion_result")
+                role = str(it.get("role") or "").strip().lower()
+                if role:
+                    return role == "assistant"
+            return False
+        return False
+
     def _probe_bridge_pending_asks(self) -> dict[str, tuple[str, str]]:
         """Query local VS Code Cline bridge /health for live in-memory pending ask state."""
         if not self._use_default_paths:
@@ -331,6 +366,21 @@ class ClineAdapter:
                         exit_code=exit_code,
                         file_mtime_ms=file_mtime_ms,
                     )
+                    paths = {
+                        "messages_path": str(mp or ""),
+                        "transcript_path": str(tp or ""),
+                        "ui_messages_path": str(self.vscode_tasks_dir / sid_str / "ui_messages.json"),
+                    }
+                    if (
+                        status == STATUS_ERROR
+                        and status_flags.get("confirmed_terminal")
+                        and self._last_round_completed(paths)
+                    ):
+                        # Process exited after the round's final assistant message
+                        # (e.g. extension-host restart); the task itself is not in error.
+                        status = STATUS_IDLE
+                        detail = f"回合已结束 · 进程收尾退出（{detail}）"
+                        status_flags = {"stale_terminated": True}
                     existing_title = by_id[sid_str][0].title if sid_str in by_id else ""
                     meta_title = self._parse_metadata_title(meta_json)
                     title = clean_single_line(meta_title or existing_title or prompt or sid_str, 120)
@@ -354,11 +404,6 @@ class ClineAdapter:
                         is_subagent=bool(is_subagent),
                         extra=extra,
                     )
-                    paths = {
-                        "messages_path": str(mp or ""),
-                        "transcript_path": str(tp or ""),
-                        "ui_messages_path": str(self.vscode_tasks_dir / sid_str / "ui_messages.json"),
-                    }
                     if not status_flags.get("confirmed_terminal") and status != STATUS_INTERRUPTED:
                         ask_hit = self._inspect_ui_or_messages_approval(paths)
                         if ask_hit is not None:
