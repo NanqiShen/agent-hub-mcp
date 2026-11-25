@@ -43,7 +43,12 @@ from .summary import (
 
 
 DEFAULT_WATCHES_PATH = Path.home() / ".hermes" / "agent-hub" / "watches.json"
-DEFAULT_HERMES_BIN = "/Users/example/.local/bin/hermes"
+# Resolve the Hermes CLI without baking in a machine-specific absolute path.
+# Override with AGENT_HUB_HERMES_BIN, otherwise fall back to ~/.local/bin/hermes
+# and finally to whatever `hermes` resolves to on PATH.
+DEFAULT_HERMES_BIN = os.environ.get("AGENT_HUB_HERMES_BIN") or str(
+    Path.home() / ".local" / "bin" / "hermes"
+)
 
 ALL_NOTIFY_EVENTS: tuple[str, ...] = (
     "completed",

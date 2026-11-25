@@ -12,7 +12,7 @@
 在 2026-11-25 上午的多任务并发运行中：
 1. **多任务并行场景**：
    - **Task 1 (Analytics Project A)**：VS Code Cline 在 the HPC cluster上完成了 Stage 3 验收（12/12 交叉校验全部 PASS，产出 `P1Z_STAGE3_FINAL_ACCEPTANCE_CN.md`），需要将报告汇总注入 ChatGPT 会话 `Analytics Project A`（`aaaaaaaa-1111-4111-8111-111111111111`），并接收 ChatGPT 终审意见反哺回 Cline。
-   - **Task 2 (Class B dataset-X 空间预测)**：DSH 与 ChatGPT 会话「Branch · Class B」（`bbbbbbbb-2222-4222-8222-222222222222`）进行学术指导研讨，Slurm 全量作业 `21408666` 在 the HPC cluster运行。
+   - **Task 2 (Class B 空间预测)**：DSH 与 ChatGPT 会话「Branch · Class B」（`bbbbbbbb-2222-4222-8222-222222222222`）进行学术指导研讨，Slurm 全量作业 `<slurm-job-id>` 在 the HPC cluster运行。
    - **Task 3 (Work Pipeline 6-arm)**：Codex 会话 `eeeeeeee-5555-4555-8555-555555555555` 在集群上推进 C/B′/B″ Duplex 恢复作业。
 
 2. **严重“串台”事故现场**：

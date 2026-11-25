@@ -1760,7 +1760,7 @@ def hub_read_session(
 
 @mcp.tool()
 def hub_bind_task(alias: str, app: str, session_id: str, note: str = "") -> str:
-    """Bind a friendly task alias (e.g. '主pipeline', 'Class B', 'Project C') to an exact (app, session_id).
+    """Bind a friendly task alias (e.g. 'main-pipeline', 'Class B', 'Project C') to an exact (app, session_id).
 
     Args:
         alias: Human-friendly task name.
